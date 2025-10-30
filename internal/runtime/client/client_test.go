@@ -89,6 +89,7 @@ func TestClient_httpCall(t *testing.T) {
 		{
 			name: "succeed for valid request and response objects",
 			request: &fakev1alpha1.FakeRequest{
+				// Note: Intentionally setting TypeMeta here to test if everything works if TypeMeta is set.
 				TypeMeta: metav1.TypeMeta{
 					Kind:       "FakeRequest",
 					APIVersion: fakev1alpha1.GroupVersion.Identifier(),
@@ -114,6 +115,7 @@ func TestClient_httpCall(t *testing.T) {
 		{
 			name: "success if request and response are valid objects - with conversion",
 			request: &fakev1alpha2.FakeRequest{
+				// Note: Intentionally setting TypeMeta here to test if everything works if TypeMeta is set.
 				TypeMeta: metav1.TypeMeta{
 					Kind:       "FakeRequest",
 					APIVersion: fakev1alpha2.GroupVersion.Identifier(),
@@ -214,6 +216,7 @@ func TestClient_httpCall(t *testing.T) {
 }
 
 func fakeHookHandler(w http.ResponseWriter, _ *http.Request) {
+	// Setting GVK because we directly Marshal to JSON.
 	response := &fakev1alpha1.FakeResponse{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "FakeHookResponse",
@@ -352,10 +355,6 @@ func Test_defaultAndValidateDiscoveryResponse(t *testing.T) {
 		{
 			name: "succeed with valid skeleton DiscoveryResponse",
 			discovery: &runtimehooksv1.DiscoveryResponse{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "DiscoveryResponse",
-					APIVersion: runtimehooksv1.GroupVersion.String(),
-				},
 				Handlers: []runtimehooksv1.ExtensionHandler{{
 					Name: "extension",
 					RequestHook: runtimehooksv1.GroupVersionHook{
@@ -369,10 +368,6 @@ func Test_defaultAndValidateDiscoveryResponse(t *testing.T) {
 		{
 			name: "error if handler name has capital letters",
 			discovery: &runtimehooksv1.DiscoveryResponse{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "DiscoveryResponse",
-					APIVersion: runtimehooksv1.GroupVersion.String(),
-				},
 				Handlers: []runtimehooksv1.ExtensionHandler{{
 					Name: "HAS-CAPITAL-LETTERS",
 					RequestHook: runtimehooksv1.GroupVersionHook{
@@ -386,10 +381,6 @@ func Test_defaultAndValidateDiscoveryResponse(t *testing.T) {
 		{
 			name: "error if handler name has full stops",
 			discovery: &runtimehooksv1.DiscoveryResponse{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "DiscoveryResponse",
-					APIVersion: runtimehooksv1.GroupVersion.String(),
-				},
 				Handlers: []runtimehooksv1.ExtensionHandler{{
 					Name: "has.full.stops",
 					RequestHook: runtimehooksv1.GroupVersionHook{
@@ -403,10 +394,6 @@ func Test_defaultAndValidateDiscoveryResponse(t *testing.T) {
 		{
 			name: "error with TimeoutSeconds of over 30 seconds",
 			discovery: &runtimehooksv1.DiscoveryResponse{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "DiscoveryResponse",
-					APIVersion: runtimehooksv1.GroupVersion.String(),
-				},
 				Handlers: []runtimehooksv1.ExtensionHandler{{
 					Name: "ext1",
 					RequestHook: runtimehooksv1.GroupVersionHook{
@@ -421,10 +408,6 @@ func Test_defaultAndValidateDiscoveryResponse(t *testing.T) {
 		{
 			name: "error with TimeoutSeconds of less than 0",
 			discovery: &runtimehooksv1.DiscoveryResponse{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "DiscoveryResponse",
-					APIVersion: runtimehooksv1.GroupVersion.String(),
-				},
 				Handlers: []runtimehooksv1.ExtensionHandler{{
 					Name: "ext1",
 					RequestHook: runtimehooksv1.GroupVersionHook{
@@ -439,10 +422,6 @@ func Test_defaultAndValidateDiscoveryResponse(t *testing.T) {
 		{
 			name: "error with FailurePolicy not Fail or Ignore",
 			discovery: &runtimehooksv1.DiscoveryResponse{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "DiscoveryResponse",
-					APIVersion: runtimehooksv1.GroupVersion.String(),
-				},
 				Handlers: []runtimehooksv1.ExtensionHandler{{
 					Name: "ext1",
 					RequestHook: runtimehooksv1.GroupVersionHook{
@@ -458,10 +437,6 @@ func Test_defaultAndValidateDiscoveryResponse(t *testing.T) {
 		{
 			name: "error when handler name is duplicated",
 			discovery: &runtimehooksv1.DiscoveryResponse{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "DiscoveryResponse",
-					APIVersion: runtimehooksv1.GroupVersion.String(),
-				},
 				Handlers: []runtimehooksv1.ExtensionHandler{
 					{
 						Name: "ext1",
@@ -491,10 +466,6 @@ func Test_defaultAndValidateDiscoveryResponse(t *testing.T) {
 		{
 			name: "error if handler GroupVersionHook is not registered",
 			discovery: &runtimehooksv1.DiscoveryResponse{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "DiscoveryResponse",
-					APIVersion: runtimehooksv1.GroupVersion.String(),
-				},
 				Handlers: []runtimehooksv1.ExtensionHandler{{
 					Name: "ext1",
 					RequestHook: runtimehooksv1.GroupVersionHook{
@@ -509,10 +480,6 @@ func Test_defaultAndValidateDiscoveryResponse(t *testing.T) {
 		{
 			name: "error if handler GroupVersion can not be parsed",
 			discovery: &runtimehooksv1.DiscoveryResponse{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "DiscoveryResponse",
-					APIVersion: runtimehooksv1.GroupVersion.String(),
-				},
 				Handlers: []runtimehooksv1.ExtensionHandler{{
 					Name: "ext1",
 					RequestHook: runtimehooksv1.GroupVersionHook{
@@ -536,10 +503,6 @@ func Test_defaultAndValidateDiscoveryResponse(t *testing.T) {
 
 func TestClient_CallExtension(t *testing.T) {
 	ns := &corev1.Namespace{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Namespace",
-			APIVersion: corev1.SchemeGroupVersion.String(),
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "foo",
 		},
@@ -761,6 +724,42 @@ func TestClient_CallExtension(t *testing.T) {
 			wantErr:            true,
 			wantResponseCached: false,
 		},
+		{
+			name:                       "should fail when calling ExtensionHandler with unknown response status and FailurePolicyFail",
+			registeredExtensionConfigs: []runtimev1.ExtensionConfig{validExtensionHandlerWithFailPolicy},
+			testServer: testServerConfig{
+				start: true,
+				responses: map[string]testServerResponse{
+					"/*": response(runtimehooksv1.ResponseStatus("Unknown")),
+				},
+			},
+			args: args{
+				hook:     fakev1alpha1.FakeHook,
+				name:     "valid-extension",
+				request:  &fakev1alpha1.FakeRequest{},
+				response: &fakev1alpha1.FakeResponse{},
+			},
+			wantErr:            true,
+			wantResponseCached: false,
+		},
+		{
+			name:                       "should fail when calling ExtensionHandler with unknown response status and FailurePolicyIgnore",
+			registeredExtensionConfigs: []runtimev1.ExtensionConfig{validExtensionHandlerWithIgnorePolicy},
+			testServer: testServerConfig{
+				start: true,
+				responses: map[string]testServerResponse{
+					"/*": response(runtimehooksv1.ResponseStatus("Unknown")),
+				},
+			},
+			args: args{
+				hook:     fakev1alpha1.FakeHook,
+				name:     "valid-extension",
+				request:  &fakev1alpha1.FakeRequest{},
+				response: &fakev1alpha1.FakeResponse{},
+			},
+			wantErr:            true,
+			wantResponseCached: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -845,10 +844,6 @@ func TestClient_CallExtension(t *testing.T) {
 
 func TestClient_CallExtensionWithClientAuthentication(t *testing.T) {
 	ns := &corev1.Namespace{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Namespace",
-			APIVersion: corev1.SchemeGroupVersion.String(),
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "foo",
 		},
@@ -1027,12 +1022,157 @@ func TestPrepareRequest(t *testing.T) {
 	})
 }
 
+func TestClient_GetAllExtensions(t *testing.T) {
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "foo",
+			Labels: map[string]string{
+				"kubernetes.io/metadata.name": "foo",
+			},
+		},
+	}
+	nsDifferent := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "different",
+			Labels: map[string]string{
+				"kubernetes.io/metadata.name": "different",
+			},
+		},
+	}
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cluster",
+			Namespace: "foo",
+		},
+	}
+	clusterDifferentNamespace := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cluster",
+			Namespace: "different",
+		},
+	}
+
+	extensionConfig := runtimev1.ExtensionConfig{
+		Spec: runtimev1.ExtensionConfigSpec{
+			ClientConfig: runtimev1.ClientConfig{
+				// Set a fake URL, in test cases where we start the test server the URL will be overridden.
+				URL:      "https://127.0.0.1/",
+				CABundle: testcerts.CACert,
+			},
+			// The extensions in this ExtensionConfig will be only registered for the foo namespace.
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{
+						Key:      "kubernetes.io/metadata.name",
+						Operator: metav1.LabelSelectorOpIn,
+						Values:   []string{ns.Name},
+					},
+				},
+			},
+		},
+		Status: runtimev1.ExtensionConfigStatus{
+			Handlers: []runtimev1.ExtensionHandler{
+				{
+					Name: "first-extension",
+					RequestHook: runtimev1.GroupVersionHook{
+						APIVersion: fakev1alpha1.GroupVersion.String(),
+						Hook:       "FakeHook",
+					},
+					TimeoutSeconds: 1,
+					FailurePolicy:  runtimev1.FailurePolicyFail,
+				},
+				{
+					Name: "second-extension",
+					RequestHook: runtimev1.GroupVersionHook{
+						APIVersion: fakev1alpha1.GroupVersion.String(),
+						Hook:       "FakeHook",
+					},
+					TimeoutSeconds: 1,
+					FailurePolicy:  runtimev1.FailurePolicyFail,
+				},
+				{
+					Name: "third-extension",
+					RequestHook: runtimev1.GroupVersionHook{
+						APIVersion: fakev1alpha1.GroupVersion.String(),
+						Hook:       "FakeHook",
+					},
+					TimeoutSeconds: 1,
+					FailurePolicy:  runtimev1.FailurePolicyFail,
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name                       string
+		registeredExtensionConfigs []runtimev1.ExtensionConfig
+		hook                       runtimecatalog.Hook
+		cluster                    *clusterv1.Cluster
+		wantExtensions             []string
+		wantErr                    bool
+	}{
+		{
+			name:                       "should return extensions if ExtensionHandlers are registered for the hook",
+			registeredExtensionConfigs: []runtimev1.ExtensionConfig{extensionConfig},
+			hook:                       fakev1alpha1.FakeHook,
+			cluster:                    cluster,
+			wantExtensions:             []string{"first-extension", "second-extension", "third-extension"},
+		},
+		{
+			name:                       "should return no extensions if ExtensionHandlers are registered for the hook in a different namespace",
+			registeredExtensionConfigs: []runtimev1.ExtensionConfig{extensionConfig},
+			hook:                       fakev1alpha1.FakeHook,
+			cluster:                    clusterDifferentNamespace,
+			wantExtensions:             []string{},
+		},
+		{
+			name:                       "should return no extensions if no ExtensionHandlers are registered for the hook",
+			registeredExtensionConfigs: []runtimev1.ExtensionConfig{},
+			hook:                       fakev1alpha1.SecondFakeHook,
+			cluster:                    cluster,
+			wantExtensions:             []string{},
+		},
+		{
+			name:                       "should return error if hook is not registered in the catalog",
+			registeredExtensionConfigs: []runtimev1.ExtensionConfig{},
+			hook:                       "UnknownHook",
+			wantErr:                    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			scheme := runtime.NewScheme()
+			g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+			g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+
+			cat := runtimecatalog.New()
+			_ = fakev1alpha1.AddToCatalog(cat)
+			_ = fakev1alpha2.AddToCatalog(cat)
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(ns, nsDifferent).
+				Build()
+			c := New(Options{
+				Catalog:  cat,
+				Registry: registry(tt.registeredExtensionConfigs),
+				Client:   fakeClient,
+			})
+
+			gotExtensions, err := c.GetAllExtensions(context.Background(), tt.hook, tt.cluster)
+			if tt.wantErr {
+				g.Expect(err).To(HaveOccurred())
+			} else {
+				g.Expect(err).ToNot(HaveOccurred())
+			}
+			g.Expect(gotExtensions).To(ConsistOf(tt.wantExtensions))
+		})
+	}
+}
+
 func TestClient_CallAllExtensions(t *testing.T) {
 	ns := &corev1.Namespace{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Namespace",
-			APIVersion: corev1.SchemeGroupVersion.String(),
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "foo",
 		},
@@ -1202,10 +1342,15 @@ func TestClient_CallAllExtensions(t *testing.T) {
 				}
 			}
 
+			scheme := runtime.NewScheme()
+			g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+			g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+
 			cat := runtimecatalog.New()
 			_ = fakev1alpha1.AddToCatalog(cat)
 			_ = fakev1alpha2.AddToCatalog(cat)
 			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
 				WithObjects(ns).
 				Build()
 			c := New(Options{
@@ -1234,10 +1379,6 @@ func TestClient_CallAllExtensions(t *testing.T) {
 func Test_client_matchNamespace(t *testing.T) {
 	g := NewWithT(t)
 	foo := &corev1.Namespace{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Namespace",
-			APIVersion: corev1.SchemeGroupVersion.String(),
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "foo",
 			Labels: map[string]string{
@@ -1246,10 +1387,6 @@ func Test_client_matchNamespace(t *testing.T) {
 		},
 	}
 	bar := &corev1.Namespace{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Namespace",
-			APIVersion: corev1.SchemeGroupVersion.String(),
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "bar",
 			Labels: map[string]string{
@@ -1457,10 +1594,6 @@ func registry(configs []runtimev1.ExtensionConfig) runtimeregistry.ExtensionRegi
 
 func fakeSuccessResponse(message string) *fakev1alpha1.FakeResponse {
 	return &fakev1alpha1.FakeResponse{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "FakeResponse",
-			APIVersion: "v1alpha1",
-		},
 		CommonResponse: runtimehooksv1.CommonResponse{
 			Message: message,
 			Status:  runtimehooksv1.ResponseStatusSuccess,
@@ -1470,10 +1603,6 @@ func fakeSuccessResponse(message string) *fakev1alpha1.FakeResponse {
 
 func fakeRetryableSuccessResponse(retryAfterSeconds int32, message string) *fakev1alpha1.RetryableFakeResponse {
 	return &fakev1alpha1.RetryableFakeResponse{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "FakeResponse",
-			APIVersion: "v1alpha1",
-		},
 		CommonResponse: runtimehooksv1.CommonResponse{
 			Message: message,
 			Status:  runtimehooksv1.ResponseStatusSuccess,

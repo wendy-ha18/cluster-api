@@ -87,6 +87,17 @@ const (
 
 	// ManagedNodeAnnotationDomain is one of the CAPI managed Node annotation domains.
 	ManagedNodeAnnotationDomain = "node.cluster.x-k8s.io"
+
+	// PendingAcknowledgeMoveAnnotation is an internal annotation added by the MS controller to a machine when being
+	// moved from the oldMS to the newMS. The annotation is removed as soon as the MS controller get the acknowledgment about the
+	// replica being accounted from the corresponding MD.
+	// Note: The annotation is added when reconciling the oldMS, and it is removed when reconciling the newMS.
+	// Note: This annotation is used in pair with AcknowledgedMoveAnnotation on MachineSets.
+	PendingAcknowledgeMoveAnnotation = "in-place-updates.internal.cluster.x-k8s.io/pending-acknowledge-move"
+
+	// UpdateInProgressAnnotation is an internal annotation added to machines by the controller owning the Machine when in-place update
+	// is started, e.g. by the MachineSet controller; the annotation will be removed by the Machine controller when in-place update is completed.
+	UpdateInProgressAnnotation = "in-place-updates.internal.cluster.x-k8s.io/update-in-progress"
 )
 
 // Machine's Available condition and corresponding reasons.
@@ -275,6 +286,10 @@ const (
 	// MachineHealthCheckUnhealthyNodeReason surfaces when the node hosted on the machine does not pass the health checks
 	// defined by a MachineHealthCheck object.
 	MachineHealthCheckUnhealthyNodeReason = "UnhealthyNode"
+
+	// MachineHealthCheckUnhealthyMachineReason surfaces when the machine does not pass the health checks
+	// defined by a MachineHealthCheck object.
+	MachineHealthCheckUnhealthyMachineReason = "UnhealthyMachine"
 
 	// MachineHealthCheckNodeStartupTimeoutReason surfaces when the node hosted on the machine does not appear within
 	// the timeout defined by a MachineHealthCheck object.

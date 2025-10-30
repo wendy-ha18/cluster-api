@@ -79,7 +79,10 @@ var (
 	stateConfirmationInterval = 100 * time.Millisecond
 )
 
-const machineSetManagerName = "capi-machineset"
+const (
+	machineSetManagerName         = "capi-machineset"
+	machineSetMetadataManagerName = "capi-machineset-metadata"
+)
 
 // Update permissions on /finalizers subresrouce is required on management clusters with 'OwnerReferencesPermissionEnforcement' plugin enabled.
 // See: https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#ownerreferencespermissionenforcement
@@ -102,6 +105,10 @@ type Reconciler struct {
 
 	ssaCache ssa.Cache
 	recorder record.EventRecorder
+
+	// Note: This field is only used for unit tests that use fake client because the fake client does not properly set resourceVersion
+	//       on BootstrapConfig/InfraMachine after ssa.Patch and then ssa.RemoveManagedFieldsForLabelsAndAnnotations would fail.
+	disableRemoveManagedFieldsForLabelsAndAnnotations bool
 }
 
 func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, options controller.Options) error {
@@ -561,19 +568,17 @@ func (r *Reconciler) syncMachines(ctx context.Context, s *scope) (ctrl.Result, e
 			return ctrl.Result{}, errors.Wrapf(err, "failed to get InfrastructureMachine %s %s",
 				updatedMachine.Spec.InfrastructureRef.Kind, klog.KRef(updatedMachine.Namespace, updatedMachine.Spec.InfrastructureRef.Name))
 		}
-		// Cleanup managed fields of all InfrastructureMachines to drop ownership of labels and annotations
-		// from "manager". We do this so that InfrastructureMachines that are created using the Create method
-		// can also work with SSA. Otherwise, labels and annotations would be co-owned by our "old" "manager"
-		// and "capi-machineset" and then we would not be able to e.g. drop labels and annotations.
-		labelsAndAnnotationsManagedFieldPaths := []contract.Path{
-			{"f:metadata", "f:annotations"},
-			{"f:metadata", "f:labels"},
-		}
-		if err := ssa.DropManagedFields(ctx, r.Client, infraMachine, machineSetManagerName, labelsAndAnnotationsManagedFieldPaths); err != nil {
-			return ctrl.Result{}, errors.Wrapf(err, "failed to update machine: failed to adjust the managedFields of the InfrastructureMachine %s", klog.KObj(infraMachine))
+		// Drop managedFields for manager:Update and capi-machineset:Apply for all objects created with CAPI <= v1.11.
+		// Starting with CAPI v1.12 we have a new managedField structure where capi-machineset-metadata will own
+		// labels and annotations and capi-machineset everything else.
+		// Note: We have to call ssa.MigrateManagedFields for every Machine created with CAPI <= v1.11 once.
+		//       Given that this was introduced in CAPI v1.12 and our n-3 upgrade policy this can
+		//       be removed with CAPI v1.15.
+		if err := ssa.MigrateManagedFields(ctx, r.Client, infraMachine, machineSetManagerName, machineSetMetadataManagerName); err != nil {
+			return ctrl.Result{}, errors.Wrapf(err, "failed to clean up managedFields of InfrastructureMachine %s", klog.KObj(infraMachine))
 		}
 		// Update in-place mutating fields on InfrastructureMachine.
-		if err := r.updateExternalObject(ctx, infraMachine, machineSet); err != nil {
+		if err := r.updateLabelsAndAnnotations(ctx, infraMachine, machineSet); err != nil {
 			return ctrl.Result{}, errors.Wrapf(err, "failed to update InfrastructureMachine %s", klog.KObj(infraMachine))
 		}
 
@@ -583,15 +588,17 @@ func (r *Reconciler) syncMachines(ctx context.Context, s *scope) (ctrl.Result, e
 				return ctrl.Result{}, errors.Wrapf(err, "failed to get BootstrapConfig %s %s",
 					updatedMachine.Spec.Bootstrap.ConfigRef.Kind, klog.KRef(updatedMachine.Namespace, updatedMachine.Spec.Bootstrap.ConfigRef.Name))
 			}
-			// Cleanup managed fields of all BootstrapConfigs to drop ownership of labels and annotations
-			// from "manager". We do this so that BootstrapConfigs that are created using the Create method
-			// can also work with SSA. Otherwise, labels and annotations would be co-owned by our "old" "manager"
-			// and "capi-machineset" and then we would not be able to e.g. drop labels and annotations.
-			if err := ssa.DropManagedFields(ctx, r.Client, bootstrapConfig, machineSetManagerName, labelsAndAnnotationsManagedFieldPaths); err != nil {
-				return ctrl.Result{}, errors.Wrapf(err, "failed to update machine: failed to adjust the managedFields of the BootstrapConfig %s", klog.KObj(bootstrapConfig))
+			// Drop managedFields for manager:Update and capi-machineset:Apply for all objects created with CAPI <= v1.11.
+			// Starting with CAPI v1.12 we have a new managedField structure where capi-machineset-metadata will own
+			// labels and annotations and capi-machineset everything else.
+			// Note: We have to call ssa.MigrateManagedFields for every Machine created with CAPI <= v1.11 once.
+			//       Given that this was introduced in CAPI v1.12 and our n-3 upgrade policy this can
+			//       be removed with CAPI v1.15.
+			if err := ssa.MigrateManagedFields(ctx, r.Client, bootstrapConfig, machineSetManagerName, machineSetMetadataManagerName); err != nil {
+				return ctrl.Result{}, errors.Wrapf(err, "failed to clean up managedFields of BootstrapConfig %s", klog.KObj(bootstrapConfig))
 			}
 			// Update in-place mutating fields on BootstrapConfig.
-			if err := r.updateExternalObject(ctx, bootstrapConfig, machineSet); err != nil {
+			if err := r.updateLabelsAndAnnotations(ctx, bootstrapConfig, machineSet); err != nil {
 				return ctrl.Result{}, errors.Wrapf(err, "failed to update BootstrapConfig %s", klog.KObj(bootstrapConfig))
 			}
 		}
@@ -714,29 +721,7 @@ func (r *Reconciler) syncReplicas(ctx context.Context, s *scope) (ctrl.Result, e
 
 			// Create the BootstrapConfig if necessary.
 			if ms.Spec.Template.Spec.Bootstrap.ConfigRef.IsDefined() {
-				apiVersion, err := contract.GetAPIVersion(ctx, r.Client, ms.Spec.Template.Spec.Bootstrap.ConfigRef.GroupKind())
-				if err == nil {
-					bootstrapConfig, bootstrapRef, err = external.CreateFromTemplate(ctx, &external.CreateFromTemplateInput{
-						Client: r.Client,
-						TemplateRef: &corev1.ObjectReference{
-							APIVersion: apiVersion,
-							Kind:       ms.Spec.Template.Spec.Bootstrap.ConfigRef.Kind,
-							Namespace:  ms.Namespace,
-							Name:       ms.Spec.Template.Spec.Bootstrap.ConfigRef.Name,
-						},
-						Namespace:   machine.Namespace,
-						Name:        machine.Name,
-						ClusterName: machine.Spec.ClusterName,
-						Labels:      machine.Labels,
-						Annotations: machine.Annotations,
-						OwnerRef: &metav1.OwnerReference{
-							APIVersion: clusterv1.GroupVersion.String(),
-							Kind:       "MachineSet",
-							Name:       ms.Name,
-							UID:        ms.UID,
-						},
-					})
-				}
+				bootstrapConfig, bootstrapRef, err = r.createBootstrapConfig(ctx, ms, machine)
 				if err != nil {
 					v1beta1conditions.MarkFalse(ms, clusterv1.MachinesCreatedV1Beta1Condition, clusterv1.BootstrapTemplateCloningFailedV1Beta1Reason, clusterv1.ConditionSeverityError, "%s", err.Error())
 					return ctrl.Result{}, errors.Wrapf(err, "failed to clone bootstrap configuration from %s %s while creating a Machine",
@@ -748,30 +733,7 @@ func (r *Reconciler) syncReplicas(ctx context.Context, s *scope) (ctrl.Result, e
 			}
 
 			// Create the InfraMachine.
-			apiVersion, err := contract.GetAPIVersion(ctx, r.Client, ms.Spec.Template.Spec.InfrastructureRef.GroupKind())
-			if err == nil {
-				infraMachine, infraRef, err = external.CreateFromTemplate(ctx, &external.CreateFromTemplateInput{
-					Client: r.Client,
-					TemplateRef: &corev1.ObjectReference{
-						APIVersion: apiVersion,
-						Kind:       ms.Spec.Template.Spec.InfrastructureRef.Kind,
-						Namespace:  ms.Namespace,
-						Name:       ms.Spec.Template.Spec.InfrastructureRef.Name,
-					},
-
-					Namespace:   machine.Namespace,
-					Name:        machine.Name,
-					ClusterName: machine.Spec.ClusterName,
-					Labels:      machine.Labels,
-					Annotations: machine.Annotations,
-					OwnerRef: &metav1.OwnerReference{
-						APIVersion: clusterv1.GroupVersion.String(),
-						Kind:       "MachineSet",
-						Name:       ms.Name,
-						UID:        ms.UID,
-					},
-				})
-			}
+			infraMachine, infraRef, err = r.createInfraMachine(ctx, ms, machine)
 			if err != nil {
 				var deleteErr error
 				if bootstrapRef.IsDefined() {
@@ -945,9 +907,9 @@ func (r *Reconciler) computeDesiredMachine(machineSet *clusterv1.MachineSet, exi
 	return desiredMachine, nil
 }
 
-// updateExternalObject updates the external object passed in with the
+// updateLabelsAndAnnotations updates the external object passed in with the
 // updated labels and annotations from the MachineSet.
-func (r *Reconciler) updateExternalObject(ctx context.Context, obj client.Object, machineSet *clusterv1.MachineSet) error {
+func (r *Reconciler) updateLabelsAndAnnotations(ctx context.Context, obj client.Object, machineSet *clusterv1.MachineSet) error {
 	updatedObject := &unstructured.Unstructured{}
 	updatedObject.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
 	updatedObject.SetNamespace(obj.GetNamespace())
@@ -959,10 +921,7 @@ func (r *Reconciler) updateExternalObject(ctx context.Context, obj client.Object
 	updatedObject.SetLabels(machineLabelsFromMachineSet(machineSet))
 	updatedObject.SetAnnotations(machineAnnotationsFromMachineSet(machineSet))
 
-	if err := ssa.Patch(ctx, r.Client, machineSetManagerName, updatedObject, ssa.WithCachingProxy{Cache: r.ssaCache, Original: obj}); err != nil {
-		return errors.Wrapf(err, "failed to update %s", klog.KObj(obj))
-	}
-	return nil
+	return ssa.Patch(ctx, r.Client, machineSetMetadataManagerName, updatedObject, ssa.WithCachingProxy{Cache: r.ssaCache, Original: obj})
 }
 
 func (r *Reconciler) getOwnerMachineDeployment(ctx context.Context, machineSet *clusterv1.MachineSet) (*clusterv1.MachineDeployment, error) {
@@ -1591,6 +1550,146 @@ func (r *Reconciler) reconcileExternalTemplateReference(ctx context.Context, clu
 	obj.SetOwnerReferences(util.EnsureOwnerRef(obj.GetOwnerReferences(), desiredOwnerRef))
 
 	return false, patchHelper.Patch(ctx, obj)
+}
+
+func (r *Reconciler) createBootstrapConfig(ctx context.Context, ms *clusterv1.MachineSet, machine *clusterv1.Machine) (*unstructured.Unstructured, clusterv1.ContractVersionedObjectReference, error) {
+	bootstrapConfig, err := r.computeDesiredBootstrapConfig(ctx, ms, machine)
+	if err != nil {
+		return nil, clusterv1.ContractVersionedObjectReference{}, errors.Wrapf(err, "failed to create BootstrapConfig")
+	}
+
+	// Create the full object with capi-machineset.
+	// Below ssa.RemoveManagedFieldsForLabelsAndAnnotations will drop ownership for labels and annotations
+	// so that in a subsequent syncMachines call capi-machineset-metadata can take ownership for them.
+	// Note: This is done in way that it does not rely on managedFields being stored in the cache, so we can optimize
+	// memory usage by dropping managedFields before storing objects in the cache.
+	if err := ssa.Patch(ctx, r.Client, machineSetManagerName, bootstrapConfig); err != nil {
+		return nil, clusterv1.ContractVersionedObjectReference{}, errors.Wrapf(err, "failed to create BootstrapConfig")
+	}
+
+	// Note: This field is only used for unit tests that use fake client because the fake client does not properly set resourceVersion
+	//       on BootstrapConfig/InfraMachine after ssa.Patch and then ssa.RemoveManagedFieldsForLabelsAndAnnotations would fail.
+	if !r.disableRemoveManagedFieldsForLabelsAndAnnotations {
+		if err := ssa.RemoveManagedFieldsForLabelsAndAnnotations(ctx, r.Client, r.APIReader, bootstrapConfig, machineSetManagerName); err != nil {
+			return nil, clusterv1.ContractVersionedObjectReference{}, errors.Wrapf(err, "failed to create BootstrapConfig")
+		}
+	}
+
+	return bootstrapConfig, clusterv1.ContractVersionedObjectReference{
+		APIGroup: bootstrapConfig.GroupVersionKind().Group,
+		Kind:     bootstrapConfig.GetKind(),
+		Name:     bootstrapConfig.GetName(),
+	}, nil
+}
+
+func (r *Reconciler) computeDesiredBootstrapConfig(ctx context.Context, ms *clusterv1.MachineSet, machine *clusterv1.Machine) (*unstructured.Unstructured, error) {
+	ownerReference := &metav1.OwnerReference{
+		APIVersion: clusterv1.GroupVersion.String(),
+		Kind:       "MachineSet",
+		Name:       ms.Name,
+		UID:        ms.UID,
+	}
+
+	apiVersion, err := contract.GetAPIVersion(ctx, r.Client, ms.Spec.Template.Spec.Bootstrap.ConfigRef.GroupKind())
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to compute desired BootstrapConfig")
+	}
+	templateRef := &corev1.ObjectReference{
+		APIVersion: apiVersion,
+		Kind:       ms.Spec.Template.Spec.Bootstrap.ConfigRef.Kind,
+		Namespace:  ms.Namespace,
+		Name:       ms.Spec.Template.Spec.Bootstrap.ConfigRef.Name,
+	}
+
+	template, err := external.Get(ctx, r.Client, templateRef)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to compute desired BootstrapConfig")
+	}
+	generateTemplateInput := &external.GenerateTemplateInput{
+		Template:    template,
+		TemplateRef: templateRef,
+		Namespace:   machine.Namespace,
+		Name:        machine.Name,
+		ClusterName: machine.Spec.ClusterName,
+		OwnerRef:    ownerReference,
+		Labels:      machine.Labels,
+		Annotations: machine.Annotations,
+	}
+	bootstrapConfig, err := external.GenerateTemplate(generateTemplateInput)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to compute desired BootstrapConfig")
+	}
+	return bootstrapConfig, nil
+}
+
+func (r *Reconciler) createInfraMachine(ctx context.Context, ms *clusterv1.MachineSet, machine *clusterv1.Machine) (*unstructured.Unstructured, clusterv1.ContractVersionedObjectReference, error) {
+	infraMachine, err := r.computeDesiredInfraMachine(ctx, ms, machine)
+	if err != nil {
+		return nil, clusterv1.ContractVersionedObjectReference{}, errors.Wrapf(err, "failed to create InfraMachine")
+	}
+
+	// Create the full object with capi-machineset.
+	// Below ssa.RemoveManagedFieldsForLabelsAndAnnotations will drop ownership for labels and annotations
+	// so that in a subsequent syncMachines call capi-machineset-metadata can take ownership for them.
+	// Note: This is done in way that it does not rely on managedFields being stored in the cache, so we can optimize
+	// memory usage by dropping managedFields before storing objects in the cache.
+	if err := ssa.Patch(ctx, r.Client, machineSetManagerName, infraMachine); err != nil {
+		return nil, clusterv1.ContractVersionedObjectReference{}, errors.Wrapf(err, "failed to create InfraMachine")
+	}
+
+	// Note: This field is only used for unit tests that use fake client because the fake client does not properly set resourceVersion
+	//       on BootstrapConfig/InfraMachine after ssa.Patch and then ssa.RemoveManagedFieldsForLabelsAndAnnotations would fail.
+	if !r.disableRemoveManagedFieldsForLabelsAndAnnotations {
+		if err := ssa.RemoveManagedFieldsForLabelsAndAnnotations(ctx, r.Client, r.APIReader, infraMachine, machineSetManagerName); err != nil {
+			return nil, clusterv1.ContractVersionedObjectReference{}, errors.Wrapf(err, "failed to create InfraMachine")
+		}
+	}
+
+	return infraMachine, clusterv1.ContractVersionedObjectReference{
+		APIGroup: infraMachine.GroupVersionKind().Group,
+		Kind:     infraMachine.GetKind(),
+		Name:     infraMachine.GetName(),
+	}, nil
+}
+
+func (r *Reconciler) computeDesiredInfraMachine(ctx context.Context, ms *clusterv1.MachineSet, machine *clusterv1.Machine) (*unstructured.Unstructured, error) {
+	ownerReference := &metav1.OwnerReference{
+		APIVersion: clusterv1.GroupVersion.String(),
+		Kind:       "MachineSet",
+		Name:       ms.Name,
+		UID:        ms.UID,
+	}
+
+	apiVersion, err := contract.GetAPIVersion(ctx, r.Client, ms.Spec.Template.Spec.InfrastructureRef.GroupKind())
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to compute desired InfraMachine")
+	}
+	templateRef := &corev1.ObjectReference{
+		APIVersion: apiVersion,
+		Kind:       ms.Spec.Template.Spec.InfrastructureRef.Kind,
+		Namespace:  ms.Namespace,
+		Name:       ms.Spec.Template.Spec.InfrastructureRef.Name,
+	}
+
+	template, err := external.Get(ctx, r.Client, templateRef)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to compute desired InfraMachine")
+	}
+	generateTemplateInput := &external.GenerateTemplateInput{
+		Template:    template,
+		TemplateRef: templateRef,
+		Namespace:   machine.Namespace,
+		Name:        machine.Name,
+		ClusterName: machine.Spec.ClusterName,
+		OwnerRef:    ownerReference,
+		Labels:      machine.Labels,
+		Annotations: machine.Annotations,
+	}
+	infraMachine, err := external.GenerateTemplate(generateTemplateInput)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to compute desired InfraMachine")
+	}
+	return infraMachine, nil
 }
 
 // Returns the machines to be remediated in the following order

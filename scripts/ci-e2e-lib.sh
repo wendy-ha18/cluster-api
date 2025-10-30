@@ -238,15 +238,17 @@ k8s::setBuildVersion() {
 
   local major
   local minor
+  local commit
   major=$(echo "${version#v}" | awk '{split($0,a,"."); print a[1]}')
   minor=$(echo "${version#v}" | awk '{split($0,a,"."); print a[2]}')
+  commit=$(git rev-parse HEAD)
 
   cat > build-version << EOL
 export KUBE_GIT_MAJOR=$major
 export KUBE_GIT_MINOR=$minor
 export KUBE_GIT_VERSION=$version
 export KUBE_GIT_TREE_STATE=clean
-export KUBE_GIT_COMMIT=d34db33f
+export KUBE_GIT_COMMIT=${commit}
 EOL
 
   export KUBE_GIT_VERSION_FILE=$PWD/build-version
@@ -256,9 +258,9 @@ EOL
 # the actual test run less sensible to the network speed.
 kind:prepullAdditionalImages () {
   # Pulling cert manager images so we can pre-load in kind nodes
-  kind::prepullImage "quay.io/jetstack/cert-manager-cainjector:v1.19.0"
-  kind::prepullImage "quay.io/jetstack/cert-manager-webhook:v1.19.0"
-  kind::prepullImage "quay.io/jetstack/cert-manager-controller:v1.19.0"
+  kind::prepullImage "quay.io/jetstack/cert-manager-cainjector:v1.19.1"
+  kind::prepullImage "quay.io/jetstack/cert-manager-webhook:v1.19.1"
+  kind::prepullImage "quay.io/jetstack/cert-manager-controller:v1.19.1"
 
   # Pull all images defined in DOCKER_PRELOAD_IMAGES.
   for IMAGE in $(grep DOCKER_PRELOAD_IMAGES: < "$E2E_CONF_FILE" | sed -E 's/.*\[(.*)\].*/\1/' | tr ',' ' '); do

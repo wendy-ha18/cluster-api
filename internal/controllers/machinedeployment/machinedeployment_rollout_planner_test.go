@@ -21,17 +21,21 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 
 	. "github.com/onsi/gomega"
+	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	apirand "k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -50,7 +54,7 @@ func TestComputeDesiredNewMS(t *testing.T) {
 			md: deployment,
 			// Add a dummy computeDesiredMS, that simply return an empty MS object.
 			// Note: there is dedicate test to validate the actual computeDesiredMS func, it is ok to simplify the unit test here.
-			computeDesiredMS: func(_ context.Context, _ *clusterv1.MachineDeployment, _ *clusterv1.MachineSet) (*clusterv1.MachineSet, error) {
+			overrideComputeDesiredMS: func(_ context.Context, _ *clusterv1.MachineDeployment, _ *clusterv1.MachineSet) (*clusterv1.MachineSet, error) {
 				return &clusterv1.MachineSet{}, nil
 			},
 		}
@@ -86,7 +90,7 @@ func TestComputeDesiredNewMS(t *testing.T) {
 			md: deployment,
 			// Add a dummy computeDesiredMS, that simply pass through the currentNewMS.
 			// Note: there is dedicate test to validate the actual computeDesiredMS func, it is ok to simplify the unit test here.
-			computeDesiredMS: func(_ context.Context, _ *clusterv1.MachineDeployment, currentNewMS *clusterv1.MachineSet) (*clusterv1.MachineSet, error) {
+			overrideComputeDesiredMS: func(_ context.Context, _ *clusterv1.MachineDeployment, currentNewMS *clusterv1.MachineSet) (*clusterv1.MachineSet, error) {
 				return currentNewMS, nil
 			},
 			oldMSs: []*clusterv1.MachineSet{oldMS},
@@ -126,7 +130,7 @@ func TestComputeDesiredNewMS(t *testing.T) {
 			md: deployment,
 			// Add a dummy computeDesiredMS, that simply pass through the currentNewMS.
 			// Note: there is dedicate test to validate the actual computeDesiredMS func, it is ok to simplify the unit test here.
-			computeDesiredMS: func(_ context.Context, _ *clusterv1.MachineDeployment, currentNewMS *clusterv1.MachineSet) (*clusterv1.MachineSet, error) {
+			overrideComputeDesiredMS: func(_ context.Context, _ *clusterv1.MachineDeployment, currentNewMS *clusterv1.MachineSet) (*clusterv1.MachineSet, error) {
 				return currentNewMS, nil
 			},
 			oldMSs: []*clusterv1.MachineSet{oldMS},
@@ -164,7 +168,7 @@ func TestComputeDesiredOldMS(t *testing.T) {
 			md: deployment,
 			// Add a dummy computeDesiredMS, that simply pass through the currentNewMS.
 			// Note: there is dedicate test to validate the actual computeDesiredMS func, it is ok to simplify the unit test here.
-			computeDesiredMS: func(_ context.Context, _ *clusterv1.MachineDeployment, currentOldMS *clusterv1.MachineSet) (*clusterv1.MachineSet, error) {
+			overrideComputeDesiredMS: func(_ context.Context, _ *clusterv1.MachineDeployment, currentOldMS *clusterv1.MachineSet) (*clusterv1.MachineSet, error) {
 				return currentOldMS, nil
 			},
 		}
@@ -201,7 +205,7 @@ func TestComputeDesiredOldMS(t *testing.T) {
 			md: deployment,
 			// Add a dummy computeDesiredMS, that simply pass through the currentNewMS.
 			// Note: there is dedicate test to validate the actual computeDesiredMS func, it is ok to simplify the unit test here.
-			computeDesiredMS: func(_ context.Context, _ *clusterv1.MachineDeployment, currentOldMS *clusterv1.MachineSet) (*clusterv1.MachineSet, error) {
+			overrideComputeDesiredMS: func(_ context.Context, _ *clusterv1.MachineDeployment, currentOldMS *clusterv1.MachineSet) (*clusterv1.MachineSet, error) {
 				return currentOldMS, nil
 			},
 		}
@@ -494,14 +498,76 @@ func machineControllerMutator(log *fileLogger, m *clusterv1.Machine, scope *roll
 }
 
 // machineSetControllerMutator fakes a small part of the MachineSet controller, just what is required for the rollout to progress.
-func machineSetControllerMutator(log *fileLogger, ms *clusterv1.MachineSet, scope *rolloutScope) {
+func machineSetControllerMutator(log *fileLogger, ms *clusterv1.MachineSet, scope *rolloutScope) error {
 	// Update counters
 	// Note: this should not be implemented in production code
 	ms.Status.Replicas = ptr.To(int32(len(scope.machineSetMachines[ms.Name])))
 
+	// TODO(in-place): when implementing in-place changes in the MachineSetController code make sure to:
+	//  - detect if there are replicas still pending AcknowledgeMove first, including also handling cleanup of the pendingAcknowledgeMoveAnnotationName on machines
+	//  - when deleting or moving
+	//  	- move or delete are mutually exclusive
+	//      - do not move machines pending a move Acknowledge, with an in-place upgrade in progress, deleted or marked for deletion (TBD if to be remediated)
+	//      - when deleting, machines updating in place should have higher priority than other machines (first get rid of not at the desired state/try to avoid unnecessary work; also those machines are unavailable).
+
 	// Sort machines to ensure stable results of move/delete operations during tests.
-	// Note: this should not be implemented in production code
-	sortMachineSetMachines(scope.machineSetMachines[ms.Name])
+	// TODO(in-place): this should not be implemented in production code for the MachineSet controller
+	sortMachineSetMachinesByName(scope.machineSetMachines[ms.Name])
+
+	// Removing updatingInPlaceAnnotation from machines after pendingAcknowledgeMove is gone in a previous reconcile (so inPlaceUpdating lasts one reconcile more)
+	// NOTE: This is a testing workaround to simulate inPlaceUpdating being completed; it is implemented in the fake MachineSet controller
+	// because while testing RolloutUpdate sequences with in-place updates we are not currently using a fake Machine controller.
+	// TODO(in-place): this should not be implemented in production code for the MachineSet controller nor in the production code for the Machine controller
+	replicasEndingInPlaceUpdate := sets.Set[string]{}
+	for _, m := range scope.machineSetMachines[ms.Name] {
+		if _, ok := m.Annotations[clusterv1.PendingAcknowledgeMoveAnnotation]; ok {
+			continue
+		}
+		if _, ok := m.Annotations[clusterv1.UpdateInProgressAnnotation]; ok {
+			delete(m.Annotations, clusterv1.UpdateInProgressAnnotation)
+			replicasEndingInPlaceUpdate.Insert(m.Name)
+		}
+	}
+	if replicasEndingInPlaceUpdate.Len() > 0 {
+		log.Logf("[MS controller] - Replicas %s completed in place update", sortAndJoin(replicasEndingInPlaceUpdate.UnsortedList()))
+	}
+
+	// If the MachineSet is accepting replicas from other MS (this is the newMS controlled by a MD),
+	// detect if there are replicas still pending AcknowledgedMove.
+	// Replicas not yet acknowledged will have a special treatment when scaling up/down the MS, because they are not included in the replica count;
+	// instead, for already acknowledged replicas, cleanup the PendingAcknowledgeMoveAnnotation.
+	acknowledgedMoveReplicas := sets.Set[string]{}
+	if replicaNames, ok := ms.Annotations[clusterv1.AcknowledgedMoveAnnotation]; ok && replicaNames != "" {
+		acknowledgedMoveReplicas.Insert(strings.Split(replicaNames, ",")...)
+	}
+	notAcknowledgeMoveReplicas := sets.Set[string]{}
+	if sourceMSs, ok := ms.Annotations[clusterv1.MachineSetReceiveMachinesFromMachineSetsAnnotation]; ok && sourceMSs != "" {
+		for _, m := range scope.machineSetMachines[ms.Name] {
+			if _, ok := m.Annotations[clusterv1.PendingAcknowledgeMoveAnnotation]; !ok {
+				continue
+			}
+
+			// If machine has been acknowledged by the MachineDeployment, cleanup pending AcknowledgeMove annotation from the machine
+			if acknowledgedMoveReplicas.Has(m.Name) {
+				delete(m.Annotations, clusterv1.PendingAcknowledgeMoveAnnotation)
+				continue
+			}
+
+			// Otherwise keep track of replicas not yet acknowledged.
+			notAcknowledgeMoveReplicas.Insert(m.Name)
+		}
+	} else {
+		// Otherwise this MachineSet is not accepting replicas from other MS (this is an oldMS controller by a MD).
+		// Drop PendingAcknowledgeMoveAnnotation from controlled Machines.
+		// Note: if there are machines recently moved but not yet accepted, those machines will be managed
+		// as any other machine and either moved to the new MS (after completing the in-place upgrade) or deleted.
+		for _, m := range scope.machineSetMachines[ms.Name] {
+			delete(m.Annotations, clusterv1.PendingAcknowledgeMoveAnnotation)
+		}
+	}
+	if notAcknowledgeMoveReplicas.Len() > 0 {
+		log.Logf("[MS controller] - Replicas %s moved from an old MachineSet still pending acknowledge from machine deployment %s", sortAndJoin(notAcknowledgeMoveReplicas.UnsortedList()), klog.KObj(scope.machineDeployment))
+	}
 
 	// if too few machines, create missing machine.
 	// new machines are created with a predictable name, so it is easier to write test case and validate rollout sequences.
@@ -535,28 +601,120 @@ func machineSetControllerMutator(log *fileLogger, ms *clusterv1.MachineSet, scop
 		}
 	}
 
-	// if too many replicas, delete exceeding machines.
-	// exceeding machines are deleted in predictable order, so it is easier to write test case and validate rollout sequences.
+	// if too many replicas, delete or move exceeding machines.
+	// exceeding machines are deleted or moved in predictable order, so it is easier to write test case and validate rollout sequences.
 	// e.g. if a ms has m1,m2,m3 created in this order, m1 will be deleted first, then m2 and finally m3.
-	machinesToDelete := max(ptr.Deref(ms.Status.Replicas, 0)-ptr.Deref(ms.Spec.Replicas, 0), 0)
+	// Note: replicas still pending AcknowledgeMove should not be counted when computing the numbers of machines to delete, because those machines are not included in ms.Spec.Replicas yet.
+	// Without this check, the following logic would try to align the number of replicas to "an incomplete" ms.Spec.Replicas thus wrongly deleting replicas that should be preserved.
+	machinesToDeleteOrMove := max(ptr.Deref(ms.Status.Replicas, 0)-int32(notAcknowledgeMoveReplicas.Len())-ptr.Deref(ms.Spec.Replicas, 0), 0)
+	if machinesToDeleteOrMove > 0 {
+		if targetMSName, ok := ms.Annotations[clusterv1.MachineSetMoveMachinesToMachineSetAnnotation]; ok && targetMSName != "" {
+			{
+				var targetMS *clusterv1.MachineSet
+				for _, ms2 := range scope.machineSets {
+					if ms2.Name == targetMSName {
+						targetMS = ms2
+						break
+					}
+				}
+				if targetMS == nil {
+					return errors.Errorf("[MS controller] - PANIC! %s is set to send replicas to %s, which does not exists", ms.Name, targetMSName)
+				}
 
-	if machinesToDelete > 0 {
-		machinesDeleted := []string{}
-		machinesSetMachines := []*clusterv1.Machine{}
-		for i, m := range scope.machineSetMachines[ms.Name] {
-			if int32(len(machinesDeleted)) >= machinesToDelete {
-				machinesSetMachines = append(machinesSetMachines, scope.machineSetMachines[ms.Name][i:]...)
-				break
+				validSourceMSs := targetMS.Annotations[clusterv1.MachineSetReceiveMachinesFromMachineSetsAnnotation]
+				sourcesSet := sets.Set[string]{}
+				sourcesSet.Insert(strings.Split(validSourceMSs, ",")...)
+				if !sourcesSet.Has(ms.Name) {
+					return errors.Errorf("[MS controller] - PANIC! %s is set to send replicas to %s, but %[2]s only accepts machines from %s", ms.Name, targetMS.Name, validSourceMSs)
+				}
+
+				// Always move all the machine that can be moved.
+				// In case the target machine set will end up with more machines than its target replica number, it will take care of this.
+				machinesToMove := machinesToDeleteOrMove
+				machinesMoved := []string{}
+				machinesSetMachines := []*clusterv1.Machine{}
+				for i, m := range scope.machineSetMachines[ms.Name] {
+					// Make sure we are not moving machines still updating in place (this includes also machines still pending AcknowledgeMove).
+					if _, ok := m.Annotations[clusterv1.UpdateInProgressAnnotation]; ok {
+						machinesSetMachines = append(machinesSetMachines, m)
+						continue
+					}
+
+					if int32(len(machinesMoved)) >= machinesToMove {
+						machinesSetMachines = append(machinesSetMachines, scope.machineSetMachines[ms.Name][i:]...)
+						break
+					}
+
+					m := scope.machineSetMachines[ms.Name][i]
+					if m.Annotations == nil {
+						m.Annotations = map[string]string{}
+					}
+					m.OwnerReferences = []metav1.OwnerReference{
+						{
+							APIVersion: clusterv1.GroupVersion.String(),
+							Kind:       "MachineSet",
+							Name:       targetMS.Name,
+							Controller: ptr.To(true),
+						},
+					}
+					m.Annotations[clusterv1.PendingAcknowledgeMoveAnnotation] = ""
+					m.Annotations[clusterv1.UpdateInProgressAnnotation] = ""
+					scope.machineSetMachines[targetMS.Name] = append(scope.machineSetMachines[targetMS.Name], m)
+					machinesMoved = append(machinesMoved, m.Name)
+				}
+				scope.machineSetMachines[ms.Name] = machinesSetMachines
+				log.Logf("[MS controller] - %s scale down to %d/%d replicas (%s moved to %s)", ms.Name, len(scope.machineSetMachines[ms.Name]), ptr.Deref(ms.Spec.Replicas, 0), strings.Join(machinesMoved, ","), targetMS.Name)
+
+				// Sort machines of the target MS to ensure consistent reporting during tests.
+				// Note: this is required because a machine can be moved to a target MachineSet that has been already reconciled before the source MachineSet (it won't sort machine by itself until the next reconcile).
+				sortMachineSetMachinesByName(scope.machineSetMachines[targetMS.Name])
 			}
-			machinesDeleted = append(machinesDeleted, m.Name)
+		} else {
+			machinesToDelete := machinesToDeleteOrMove
+			machinesDeleted := []string{}
+
+			// Note: in the test code exceeding machines are deleted in predictable order, so it is easier to write test case and validate rollout sequences.
+			// e.g. if a ms has m1,m2,m3 created in this order, m1 will be deleted first, then m2 and finally m3.
+			// note: In case the system has to delete some replicas, and those replicas are still updating in place, they gets deleted first.
+			//
+			// This prevents the system to perform unnecessary in-place updates. e.g.
+			// - In place rollout of MD with 3 Replicas, maxSurge 1, MaxUnavailable 0
+			//   - First create m4 to create a buffer for doing in place
+			//   - Move old machines (m1, m2, m3)
+			// - Resulting new MS at this point has 4 replicas m1, m2, m3 (updating in place) and (m4).
+			// - The system scales down MS, and the system does this getting rid of m3 - the last replica that started in place.
+			machinesSetMachinesSortedByDeletePriority := sortMachineSetMachinesByDeletionPriorityAndName(scope.machineSetMachines[ms.Name])
+			machinesSetMachines := []*clusterv1.Machine{}
+			for i, m := range machinesSetMachinesSortedByDeletePriority {
+				if int32(len(machinesDeleted)) >= machinesToDelete {
+					machinesSetMachines = append(machinesSetMachines, machinesSetMachinesSortedByDeletePriority[i:]...)
+					break
+				}
+				machinesDeleted = append(machinesDeleted, m.Name)
+			}
+			scope.machineSetMachines[ms.Name] = machinesSetMachines
+
+			// Sort machines of the target MS to ensure consistent reporting during tests.
+			// Note: this is required specifically by the test code because a machine can be moved to a target MachineSet that has been already
+			// reconciled before the source MachineSet (it won't sort machine by itself until the next reconcile), and test machinery assumes machine are sorted.
+			sortMachineSetMachinesByName(scope.machineSetMachines[ms.Name])
+			log.Logf("[MS controller] - %s scale down to %d/%[2]d replicas (%s deleted)", ms.Name, ptr.Deref(ms.Spec.Replicas, 0), strings.Join(machinesDeleted, ","))
 		}
-		scope.machineSetMachines[ms.Name] = machinesSetMachines
-		log.Logf("[MS controller] - %s scale down to %d/%[2]d replicas (%s deleted)", ms.Name, ptr.Deref(ms.Spec.Replicas, 0), strings.Join(machinesDeleted, ","))
 	}
 
 	// Update counters
+	// TODO(in-place): consider if to revisit this as soon as we have more details on how we are going to surface unavailability of machines updating in place.
 	ms.Status.Replicas = ptr.To(int32(len(scope.machineSetMachines[ms.Name])))
-	ms.Status.AvailableReplicas = ptr.To(int32(len(scope.machineSetMachines[ms.Name])))
+	availableReplicas := int32(0)
+	for _, m := range scope.machineSetMachines[ms.Name] {
+		if _, ok := m.Annotations[clusterv1.UpdateInProgressAnnotation]; ok {
+			continue
+		}
+		availableReplicas++
+	}
+	ms.Status.AvailableReplicas = ptr.To(availableReplicas)
+
+	return nil
 }
 
 type rolloutScope struct {
@@ -700,10 +858,27 @@ func (r rolloutScope) String() string {
 func msLog(ms *clusterv1.MachineSet, machines []*clusterv1.Machine) string {
 	sb := strings.Builder{}
 	machineNames := []string{}
+	acknowledgedMoveMachines := sets.Set[string]{}
+	if replicaNames, ok := ms.Annotations[clusterv1.AcknowledgedMoveAnnotation]; ok && replicaNames != "" {
+		acknowledgedMoveMachines.Insert(strings.Split(replicaNames, ",")...)
+	}
 	for _, m := range machines {
-		machineNames = append(machineNames, m.Name)
+		name := m.Name
+		if _, ok := m.Annotations[clusterv1.PendingAcknowledgeMoveAnnotation]; ok && !acknowledgedMoveMachines.Has(name) {
+			name += "🟠"
+		}
+		if _, ok := m.Annotations[clusterv1.UpdateInProgressAnnotation]; ok {
+			name += "🟡"
+		}
+		machineNames = append(machineNames, name)
 	}
 	sb.WriteString(strings.Join(machineNames, ","))
+	if moveTo, ok := ms.Annotations[clusterv1.MachineSetMoveMachinesToMachineSetAnnotation]; ok {
+		sb.WriteString(fmt.Sprintf(" => %s", moveTo))
+	}
+	if moveFrom, ok := ms.Annotations[clusterv1.MachineSetReceiveMachinesFromMachineSetsAnnotation]; ok {
+		sb.WriteString(fmt.Sprintf(" <= %s", moveFrom))
+	}
 	msLog := fmt.Sprintf("%d/%d replicas (%s)", ptr.Deref(ms.Status.Replicas, 0), ptr.Deref(ms.Spec.Replicas, 0), sb.String())
 	return msLog
 }
@@ -869,12 +1044,41 @@ func (l *fileLogger) WriteLogAndCompareWithGoldenFile() (string, string, error) 
 	return current, golden, nil
 }
 
-func sortMachineSetMachines(machines []*clusterv1.Machine) {
+func sortMachineSetMachinesByName(machines []*clusterv1.Machine) {
 	sort.Slice(machines, func(i, j int) bool {
-		iIndex, _ := strconv.Atoi(strings.TrimPrefix(machines[i].Name, "m"))
-		jiIndex, _ := strconv.Atoi(strings.TrimPrefix(machines[j].Name, "m"))
-		return iIndex < jiIndex
+		iNameIndex, _ := strconv.Atoi(strings.TrimPrefix(machines[i].Name, "m"))
+		jNameIndex, _ := strconv.Atoi(strings.TrimPrefix(machines[j].Name, "m"))
+		return iNameIndex < jNameIndex
 	})
+}
+
+func sortMachineSetMachinesByDeletionPriorityAndName(machines []*clusterv1.Machine) []*clusterv1.Machine {
+	machinesSetMachinesSortedByDeletePriority := slices.Clone(machines)
+
+	// Note: machines updating in place must be deleted first.
+	// in case of ties:
+	// - if both machines are updating in place, delete first the machine with the highest machine NameIndex (e.g. between m3 and m4, pick m4, aka the last machine being moved)
+	// - if both machines are not updating in place, delete first the machine with the lowest machine NameIndex (e.g. between m3 and m4, pick m3)
+	sort.Slice(machinesSetMachinesSortedByDeletePriority, func(i, j int) bool {
+		iPriority := 100
+		if _, ok := machinesSetMachinesSortedByDeletePriority[i].Annotations[clusterv1.UpdateInProgressAnnotation]; ok {
+			iPriority = 1
+		}
+		jPriority := 100
+		if _, ok := machinesSetMachinesSortedByDeletePriority[j].Annotations[clusterv1.UpdateInProgressAnnotation]; ok {
+			jPriority = 1
+		}
+		if iPriority == jPriority {
+			iNameIndex, _ := strconv.Atoi(strings.TrimPrefix(machinesSetMachinesSortedByDeletePriority[i].Name, "m"))
+			jNameIndex, _ := strconv.Atoi(strings.TrimPrefix(machinesSetMachinesSortedByDeletePriority[j].Name, "m"))
+			if iPriority == 1 {
+				return iNameIndex > jNameIndex
+			}
+			return iNameIndex < jNameIndex
+		}
+		return iPriority < jPriority
+	})
+	return machinesSetMachinesSortedByDeletePriority
 }
 
 // default task order ensure the controllers are run in a consistent and predictable way: md, ms1, ms2 and so on.
@@ -953,6 +1157,15 @@ func withStatusAvailableReplicas(r int32) fakeMachineSetOption {
 	}
 }
 
+func withMSAnnotation(name, value string) fakeMachineSetOption {
+	return func(ms *clusterv1.MachineSet) {
+		if ms.Annotations == nil {
+			ms.Annotations = map[string]string{}
+		}
+		ms.Annotations[name] = value
+	}
+}
+
 func createMS(name, failureDomain string, replicas int32, opts ...fakeMachineSetOption) *clusterv1.MachineSet {
 	ms := &clusterv1.MachineSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -974,8 +1187,17 @@ func createMS(name, failureDomain string, replicas int32, opts ...fakeMachineSet
 	return ms
 }
 
-func createM(name, ownedByMS, failureDomain string) *clusterv1.Machine {
-	return &clusterv1.Machine{
+func withMAnnotation(name, value string) fakeMachinesOption {
+	return func(m *clusterv1.Machine) {
+		if m.Annotations == nil {
+			m.Annotations = map[string]string{}
+		}
+		m.Annotations[name] = value
+	}
+}
+
+func createM(name, ownedByMS, failureDomain string, opts ...fakeMachinesOption) *clusterv1.Machine {
+	m := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 			OwnerReferences: []metav1.OwnerReference{
@@ -992,4 +1214,8 @@ func createM(name, ownedByMS, failureDomain string) *clusterv1.Machine {
 			FailureDomain: failureDomain,
 		},
 	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
 }

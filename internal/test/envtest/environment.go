@@ -52,6 +52,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -296,6 +297,37 @@ func newEnvironment(scheme *runtime.Scheme, additionalCRDDirectoryPaths []string
 		WebhookInstallOptions: initWebhookInstallOptions(),
 	}
 
+	// if ARTIFACTS is setup, configure apiserver audit logs to log to ARTIFACTS dir
+	if os.Getenv("ARTIFACTS") != "" {
+		_, packageFileName, _, _ := goruntime.Caller(2)
+		relativePathPackageCallerFile, err := filepath.Rel(root, packageFileName)
+		if err != nil {
+			klog.Fatalf("unable to get relative path of calling package %+v", err)
+		}
+
+		relativePathPackageCallerDir := filepath.Dir(relativePathPackageCallerFile)
+		auditLogsDir := filepath.Join(os.Getenv("ARTIFACTS"), relativePathPackageCallerDir)
+		auditLogsFilePath := filepath.Join(auditLogsDir, "apiserver-audit-logs")
+
+		if err = os.MkdirAll(auditLogsDir, 0750); err != nil {
+			klog.Fatalf("failed to create audit logs dir: %+v", err)
+		}
+
+		auditPolicyPath, err := writeAuditPolicy(auditLogsDir)
+		if err != nil {
+			klog.Fatalf("failed to write audit logs policy file: %+v", err)
+		}
+
+		env.ControlPlane = envtest.ControlPlane{}
+		env.ControlPlane.APIServer = &envtest.APIServer{}
+		env.ControlPlane.APIServer.Configure().Set("audit-log-path", auditLogsFilePath)
+		env.ControlPlane.APIServer.Configure().Set("audit-log-format", "json")
+		env.ControlPlane.APIServer.Configure().Set("audit-policy-file", auditPolicyPath)
+		env.ControlPlane.APIServer.Configure().Set("audit-log-maxage", "0")
+		env.ControlPlane.APIServer.Configure().Set("audit-log-maxbackup", "0")
+		env.ControlPlane.APIServer.Configure().Set("audit-log-maxsize", "0")
+	}
+
 	if _, err := env.Start(); err != nil {
 		err = kerrors.NewAggregate([]error{err, env.Stop()})
 		panic(err)
@@ -403,6 +435,30 @@ func newEnvironment(scheme *runtime.Scheme, additionalCRDDirectoryPaths []string
 		Config:  mgr.GetConfig(),
 		env:     env,
 	}
+}
+
+func writeAuditPolicy(dir string) (string, error) {
+	policyFile := filepath.Join(dir, "audit-policy.yaml")
+
+	policyYAML := []byte(`
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  - level: RequestResponse
+    resources:
+      - group: ""
+      - group: "cluster.x-k8s.io"
+      - group: "infrastructure.cluster.x-k8s.io"
+      - group: "controlplane.cluster.x-k8s.io"
+      - group: "addons.cluster.x-k8s.io"
+      - group: "bootstrap.cluster.x-k8s.io"
+      - group: "runtime.cluster.x-k8s.io"
+`)
+
+	if err := os.WriteFile(policyFile, policyYAML, 0600); err != nil {
+		return "", err
+	}
+	return policyFile, nil
 }
 
 // start starts the manager.
@@ -562,6 +618,14 @@ func (e *Environment) DeleteAndWait(ctx context.Context, obj client.Object, opts
 //
 // NOTE: Waiting for the cache to be updated helps in preventing test flakes due to the cache sync delays.
 func (e *Environment) PatchAndWait(ctx context.Context, obj client.Object, opts ...client.PatchOption) error {
+	objGVK, err := apiutil.GVKForObject(obj, e.Scheme())
+	if err != nil {
+		return errors.Wrapf(err, "failed to get GVK to set GVK on object")
+	}
+	// Ensure that GVK is explicitly set because e.Patch below uses json.Marshal
+	// to serialize the object and the apiserver would complain if GVK is not sent.
+	obj.GetObjectKind().SetGroupVersionKind(objGVK)
+
 	key := client.ObjectKeyFromObject(obj)
 	objCopy := obj.DeepCopyObject().(client.Object)
 	if err := e.GetAPIReader().Get(ctx, key, objCopy); err != nil {

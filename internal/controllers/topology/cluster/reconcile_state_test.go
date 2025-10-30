@@ -43,6 +43,7 @@ import (
 	. "sigs.k8s.io/controller-runtime/pkg/envtest/komega"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
+	controlplanev1 "sigs.k8s.io/cluster-api/api/controlplane/kubeadm/v1beta2"
 	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
@@ -1906,6 +1907,13 @@ func TestReconcileControlPlaneMachineHealthCheck(t *testing.T) {
 					TimeoutSeconds: ptr.To(int32(5 * 60)),
 				},
 			},
+			UnhealthyMachineConditions: []clusterv1.UnhealthyMachineCondition{
+				{
+					Type:           controlplanev1.KubeadmControlPlaneMachineEtcdPodHealthyCondition,
+					Status:         metav1.ConditionUnknown,
+					TimeoutSeconds: ptr.To(int32(5 * 60)),
+				},
+			},
 		},
 	}
 	maxUnhealthy := intstr.Parse("45%")
@@ -1926,6 +1934,7 @@ func TestReconcileControlPlaneMachineHealthCheck(t *testing.T) {
 	mhcBuilder := builder.MachineHealthCheck(metav1.NamespaceDefault, "cp1").
 		WithSelector(*selectors.ForControlPlaneMHC()).
 		WithUnhealthyNodeConditions(mhcClass.Checks.UnhealthyNodeConditions).
+		WithUnhealthyMachineConditions(mhcClass.Checks.UnhealthyMachineConditions).
 		WithClusterName("cluster1")
 
 	tests := []struct {
@@ -2035,10 +2044,7 @@ func TestReconcileControlPlaneMachineHealthCheck(t *testing.T) {
 					g.Expect(env.PatchAndWait(ctx, tt.current.InfrastructureMachineTemplate, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 				}
 				if tt.current.MachineHealthCheck != nil {
-					// Note: Have to set GVK on typed objects when using SSA.
-					mhc := tt.current.MachineHealthCheck.DeepCopy()
-					mhc.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("MachineHealthCheck"))
-					g.Expect(env.PatchAndWait(ctx, mhc, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
+					g.Expect(env.PatchAndWait(ctx, tt.current.MachineHealthCheck, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 				}
 			}
 
@@ -2322,10 +2328,7 @@ func TestReconcileMachineDeployments(t *testing.T) {
 			for _, s := range tt.current {
 				g.Expect(env.PatchAndWait(ctx, s.InfrastructureMachineTemplate, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 				g.Expect(env.PatchAndWait(ctx, s.BootstrapTemplate, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
-				// Note: Have to set GVK on typed objects when using SSA.
-				md := s.Object.DeepCopy()
-				md.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("MachineDeployment"))
-				g.Expect(env.PatchAndWait(ctx, md, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
+				g.Expect(env.PatchAndWait(ctx, s.Object, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 			}
 
 			currentMachineDeploymentStates := toMachineDeploymentTopologyStateMap(tt.current)
@@ -2339,10 +2342,7 @@ func TestReconcileMachineDeployments(t *testing.T) {
 
 				g.Expect(env.PatchAndWait(ctx, mdState.InfrastructureMachineTemplate, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 				g.Expect(env.PatchAndWait(ctx, mdState.BootstrapTemplate, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
-				// Note: Have to set GVK on typed objects when using SSA.
-				md := mdState.Object.DeepCopy()
-				md.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("MachineDeployment"))
-				g.Expect(env.PatchAndWait(ctx, md, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
+				g.Expect(env.PatchAndWait(ctx, mdState.Object, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 			}
 
 			s.Desired = &scope.ClusterState{MachineDeployments: toMachineDeploymentTopologyStateMap(tt.desired)}
@@ -2735,10 +2735,7 @@ func TestReconcileMachinePools(t *testing.T) {
 			for _, s := range tt.current {
 				g.Expect(env.PatchAndWait(ctx, s.InfrastructureMachinePoolObject, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 				g.Expect(env.PatchAndWait(ctx, s.BootstrapObject, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
-				// Note: Have to set GVK on typed objects when using SSA.
-				mp := s.Object.DeepCopy()
-				mp.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("MachinePool"))
-				g.Expect(env.PatchAndWait(ctx, mp, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
+				g.Expect(env.PatchAndWait(ctx, s.Object, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 			}
 
 			currentMachinePoolStates := toMachinePoolTopologyStateMap(tt.current)
@@ -2752,10 +2749,7 @@ func TestReconcileMachinePools(t *testing.T) {
 
 				g.Expect(env.PatchAndWait(ctx, mpState.InfrastructureMachinePoolObject, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 				g.Expect(env.PatchAndWait(ctx, mpState.BootstrapObject, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
-				// Note: Have to set GVK on typed objects when using SSA.
-				mp := mpState.Object.DeepCopy()
-				mp.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("MachinePool"))
-				g.Expect(env.PatchAndWait(ctx, mp, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
+				g.Expect(env.PatchAndWait(ctx, mpState.Object, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 			}
 
 			s.Desired = &scope.ClusterState{MachinePools: toMachinePoolTopologyStateMap(tt.desired)}
@@ -3436,6 +3430,13 @@ func TestReconcileMachineDeploymentMachineHealthCheck(t *testing.T) {
 				TimeoutSeconds: ptr.To(int32(5 * 60)),
 			},
 		}).
+		WithUnhealthyMachineConditions([]clusterv1.UnhealthyMachineCondition{
+			{
+				Type:           controlplanev1.KubeadmControlPlaneMachineEtcdPodHealthyCondition,
+				Status:         metav1.ConditionUnknown,
+				TimeoutSeconds: ptr.To(int32(5 * 60)),
+			},
+		}).
 		WithClusterName("cluster1")
 
 	infrastructureMachineTemplate := builder.TestInfrastructureMachineTemplate(metav1.NamespaceDefault, "infrastructure-machine-1").Build()
@@ -3543,10 +3544,7 @@ func TestReconcileMachineDeploymentMachineHealthCheck(t *testing.T) {
 			uidsByName := map[string]types.UID{}
 
 			for _, mdts := range tt.current {
-				// Note: Have to set GVK on typed objects when using SSA.
-				mdtsMD := mdts.Object.DeepCopy()
-				mdtsMD.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("MachineDeployment"))
-				g.Expect(env.PatchAndWait(ctx, mdtsMD, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
+				g.Expect(env.PatchAndWait(ctx, mdts.Object, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 				g.Expect(env.PatchAndWait(ctx, mdts.InfrastructureMachineTemplate, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 				g.Expect(env.PatchAndWait(ctx, mdts.BootstrapTemplate, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 
@@ -3557,10 +3555,7 @@ func TestReconcileMachineDeploymentMachineHealthCheck(t *testing.T) {
 						ref.UID = mdts.Object.GetUID()
 						mdts.MachineHealthCheck.OwnerReferences[i] = ref
 					}
-					// Note: Have to set GVK on typed objects when using SSA.
-					mdtsMHC := mdts.MachineHealthCheck.DeepCopy()
-					mdtsMHC.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("MachineHealthCheck"))
-					g.Expect(env.PatchAndWait(ctx, mdtsMHC, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
+					g.Expect(env.PatchAndWait(ctx, mdts.MachineHealthCheck, client.ForceOwnership, client.FieldOwner(structuredmerge.TopologyManagerName))).To(Succeed())
 				}
 			}
 
@@ -3886,6 +3881,13 @@ func TestReconciler_reconcileMachineHealthCheck(t *testing.T) {
 				TimeoutSeconds: ptr.To(int32(5 * 60)),
 			},
 		}).
+		WithUnhealthyMachineConditions([]clusterv1.UnhealthyMachineCondition{
+			{
+				Type:           controlplanev1.KubeadmControlPlaneMachineEtcdPodHealthyCondition,
+				Status:         metav1.ConditionUnknown,
+				TimeoutSeconds: ptr.To(int32(5 * 60)),
+			},
+		}).
 		WithClusterName("cluster1")
 	tests := []struct {
 		name    string
@@ -3910,11 +3912,23 @@ func TestReconciler_reconcileMachineHealthCheck(t *testing.T) {
 					Status:         corev1.ConditionUnknown,
 					TimeoutSeconds: ptr.To(int32(1000 * 60)),
 				},
+			}).WithUnhealthyMachineConditions([]clusterv1.UnhealthyMachineCondition{
+				{
+					Type:           controlplanev1.KubeadmControlPlaneMachineEtcdPodHealthyCondition,
+					Status:         metav1.ConditionUnknown,
+					TimeoutSeconds: ptr.To(int32(1000 * 60)),
+				},
 			}).Build(),
 			want: mhcBuilder.DeepCopy().WithUnhealthyNodeConditions([]clusterv1.UnhealthyNodeCondition{
 				{
 					Type:           corev1.NodeReady,
 					Status:         corev1.ConditionUnknown,
+					TimeoutSeconds: ptr.To(int32(1000 * 60)),
+				},
+			}).WithUnhealthyMachineConditions([]clusterv1.UnhealthyMachineCondition{
+				{
+					Type:           controlplanev1.KubeadmControlPlaneMachineEtcdPodHealthyCondition,
+					Status:         metav1.ConditionUnknown,
 					TimeoutSeconds: ptr.To(int32(1000 * 60)),
 				},
 			}).Build(),
