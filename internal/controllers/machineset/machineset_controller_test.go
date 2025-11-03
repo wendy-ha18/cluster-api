@@ -1395,6 +1395,11 @@ func TestMachineSetReconciler_syncMachines(t *testing.T) {
 	g.Expect(ssa.Patch(ctx, env.Client, machineSetManagerName, bootstrapConfig)).To(Succeed())
 	g.Expect(ssa.RemoveManagedFieldsForLabelsAndAnnotations(ctx, env.Client, env.GetAPIReader(), bootstrapConfig, machineSetManagerName)).To(Succeed())
 
+	// Set ownerReferences of the Machines to the MachineSet to ensure deterministic field ownership by capi-machineset below.
+	// Note: There is code in the Machine controller that sets ownerRefs to the Cluster on standalone Machines.
+	inPlaceMutatingMachine.SetOwnerReferences([]metav1.OwnerReference{*metav1.NewControllerRef(ms, machineSetKind)})
+	deletingMachine.SetOwnerReferences([]metav1.OwnerReference{*metav1.NewControllerRef(ms, machineSetKind)})
+
 	// Create Machines (same as in syncReplicas)
 	g.Expect(ssa.Patch(ctx, env.Client, machineSetManagerName, inPlaceMutatingMachine)).To(Succeed())
 	g.Expect(ssa.Patch(ctx, env.Client, machineSetManagerName, deletingMachine)).To(Succeed())
@@ -1573,20 +1578,20 @@ func TestMachineSetReconciler_syncMachines(t *testing.T) {
 	g.Eventually(func(g Gomega) {
 		updatedDeletingMachine := deletingMachine.DeepCopy()
 		g.Expect(env.GetAPIReader().Get(ctx, client.ObjectKeyFromObject(updatedDeletingMachine), updatedDeletingMachine)).To(Succeed())
-		statusManagedFields := managedFieldsMatching(updatedInPlaceMutatingMachine.ManagedFields, "manager", metav1.ManagedFieldsOperationUpdate, "status")
+		statusManagedFields := managedFieldsMatching(updatedDeletingMachine.ManagedFields, "manager", metav1.ManagedFieldsOperationUpdate, "status")
 		g.Expect(statusManagedFields).To(HaveLen(1))
 		g.Expect(cleanupTime(updatedDeletingMachine.ManagedFields)).To(ConsistOf(toManagedFields([]managedFieldEntry{{
 			// capi-machineset owns almost everything.
 			Manager:    machineSetManagerName,
 			Operation:  metav1.ManagedFieldsOperationApply,
 			APIVersion: clusterv1.GroupVersion.String(),
-			FieldsV1:   "{\"f:metadata\":{\"f:finalizers\":{\"v:\\\"testing-finalizer\\\"\":{}}},\"f:spec\":{\"f:bootstrap\":{\"f:dataSecretName\":{}},\"f:clusterName\":{},\"f:infrastructureRef\":{\"f:apiGroup\":{},\"f:kind\":{},\"f:name\":{}}}}",
+			FieldsV1:   fmt.Sprintf("{\"f:metadata\":{\"f:finalizers\":{\"v:\\\"testing-finalizer\\\"\":{}},\"f:ownerReferences\":{\"k:{\\\"uid\\\":\\\"%s\\\"}\":{}}},\"f:spec\":{\"f:bootstrap\":{\"f:dataSecretName\":{}},\"f:clusterName\":{},\"f:infrastructureRef\":{\"f:apiGroup\":{},\"f:kind\":{},\"f:name\":{}}}}", ms.UID),
 		}, {
 			// manager owns the fields that are propagated in-place for deleting Machines in syncMachines via patchHelper.
 			Manager:    "manager",
 			Operation:  metav1.ManagedFieldsOperationUpdate,
 			APIVersion: clusterv1.GroupVersion.String(),
-			FieldsV1:   fmt.Sprintf("{\"f:metadata\":{\"f:ownerReferences\":{\".\":{},\"k:{\\\"uid\\\":\\\"%s\\\"}\":{}}},\"f:spec\":{\"f:deletion\":{\"f:nodeDrainTimeoutSeconds\":{},\"f:nodeVolumeDetachTimeoutSeconds\":{}},\"f:minReadySeconds\":{},\"f:readinessGates\":{\".\":{},\"k:{\\\"conditionType\\\":\\\"foo\\\"}\":{\".\":{},\"f:conditionType\":{}}}}}", testCluster.UID),
+			FieldsV1:   "{\"f:spec\":{\"f:deletion\":{\"f:nodeDrainTimeoutSeconds\":{},\"f:nodeVolumeDetachTimeoutSeconds\":{}},\"f:minReadySeconds\":{},\"f:readinessGates\":{\".\":{},\"k:{\\\"conditionType\\\":\\\"foo\\\"}\":{\".\":{},\"f:conditionType\":{}}}}}",
 		}, {
 			// manager owns status.
 			Manager:    "manager",
@@ -1618,6 +1623,11 @@ func TestMachineSetReconciler_syncMachines(t *testing.T) {
 }
 
 func TestMachineSetReconciler_reconcileUnhealthyMachines(t *testing.T) {
+	// Use a separate scheme for fake client to avoid race conditions with the global scheme.
+	scheme := runtime.NewScheme()
+	_ = apiextensionsv1.AddToScheme(scheme)
+	_ = clusterv1.AddToScheme(scheme)
+
 	t.Run("should delete unhealthy machines if preflight checks pass", func(t *testing.T) {
 		g := NewWithT(t)
 
@@ -1687,7 +1697,7 @@ func TestMachineSetReconciler_reconcileUnhealthyMachines(t *testing.T) {
 
 		machines := []*clusterv1.Machine{unhealthyMachine, healthyMachine}
 
-		fakeClient := fake.NewClientBuilder().WithObjects(controlPlaneStable, unhealthyMachine, healthyMachine).WithStatusSubresource(&clusterv1.Machine{}).Build()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(controlPlaneStable, unhealthyMachine, healthyMachine).WithStatusSubresource(&clusterv1.Machine{}).Build()
 		r := &Reconciler{
 			Client: fakeClient,
 		}
@@ -1791,7 +1801,7 @@ func TestMachineSetReconciler_reconcileUnhealthyMachines(t *testing.T) {
 		}
 
 		machines := []*clusterv1.Machine{unhealthyMachine, healthyMachine}
-		fakeClient := fake.NewClientBuilder().WithObjects(controlPlaneUpgrading, builder.GenericControlPlaneCRD, unhealthyMachine, healthyMachine).WithStatusSubresource(&clusterv1.Machine{}).Build()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(controlPlaneUpgrading, builder.GenericControlPlaneCRD, unhealthyMachine, healthyMachine).WithStatusSubresource(&clusterv1.Machine{}).Build()
 		r := &Reconciler{
 			Client:          fakeClient,
 			PreflightChecks: sets.Set[clusterv1.MachineSetPreflightCheck]{}.Insert(clusterv1.MachineSetPreflightCheckAll),
@@ -1934,7 +1944,7 @@ func TestMachineSetReconciler_reconcileUnhealthyMachines(t *testing.T) {
 		}
 
 		machines := []*clusterv1.Machine{unhealthyMachine, healthyMachine}
-		fakeClient := fake.NewClientBuilder().WithObjects(
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			machineDeployment,
 			machineSetOld,
 			machineSetCurrent,
@@ -2116,7 +2126,7 @@ func TestMachineSetReconciler_reconcileUnhealthyMachines(t *testing.T) {
 			},
 		}
 
-		fakeClient := fake.NewClientBuilder().WithObjects(cluster, machineDeployment, healthyMachine).
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, machineDeployment, healthyMachine).
 			WithStatusSubresource(&clusterv1.Machine{}, &clusterv1.MachineSet{}, &clusterv1.MachineDeployment{})
 		// Create the unhealthy machines.
 		for _, machine := range unhealthyMachines {
