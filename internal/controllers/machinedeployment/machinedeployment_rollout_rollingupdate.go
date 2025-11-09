@@ -30,6 +30,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/internal/controllers/machinedeployment/mdutil"
+	"sigs.k8s.io/cluster-api/internal/util/inplace"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/collections"
 )
@@ -160,6 +161,19 @@ func (p *rolloutPlanner) reconcileReplicasPendingAcknowledgeMove(ctx context.Con
 	}
 }
 
+// reconcileNewMachineSet reconciles the replica number for the new MS.
+// Note: In case of scale down this function does not consider the possible impact on availability.
+// This is considered acceptable because historically it never led to any problem, but we might revisit this in the future
+// because some limitations of this approach are becoming more evident, e.g.
+//
+//	when users scale down the MD, the operation might temporarily breach min availability (maxUnavailable)
+//
+// There are code paths specifically added to prevent this issue becoming more relevant when doing in-place updates;
+// e.g. the MS controller will give highest delete priority to Machines still updating in-place,
+// which are also unavailable Machines.
+//
+// Notably, there is also no agreement yet on a different way forward because e.g. limiting scale down of the
+// new MS could lead e.g. to completing in place update of Machines that will be otherwise deleted.
 func (p *rolloutPlanner) reconcileNewMachineSet(ctx context.Context) error {
 	log := ctrl.LoggerFrom(ctx)
 	allMSs := append(p.oldMSs, p.newMS)
@@ -401,7 +415,6 @@ func (p *rolloutPlanner) reconcileInPlaceUpdateIntent(ctx context.Context) error
 		}
 
 		// Check if the MachineSet can update in place; if not, move to the next MachineSet.
-		// TODO(in-place): replace with a call to the hook
 		canUpdateMachineSetInPlaceFunc := func(_ *clusterv1.MachineSet) bool { return false }
 		if p.overrideCanUpdateMachineSetInPlace != nil {
 			canUpdateMachineSetInPlaceFunc = p.overrideCanUpdateMachineSetInPlace
@@ -490,6 +503,7 @@ func (p *rolloutPlanner) reconcileInPlaceUpdateIntent(ctx context.Context) error
 }
 
 func (p *rolloutPlanner) scalingOrInPlaceUpdateInProgress(_ context.Context) bool {
+	// Check if the new MS or old MS are scaling.
 	if ptr.Deref(p.newMS.Spec.Replicas, 0) != ptr.Deref(p.newMS.Status.Replicas, 0) {
 		return true
 	}
@@ -501,10 +515,27 @@ func (p *rolloutPlanner) scalingOrInPlaceUpdateInProgress(_ context.Context) boo
 			return true
 		}
 	}
+
+	// Check that there are no updates in progress.
+	// We check both that the newMS MachineSet will report that the update is completed via .status.upToDateReplicas
+	// and the Machine controller through the annotations so this code does not depend on a specific execution order
+	// of the MachineSet and Machine controllers.
+	if ptr.Deref(p.newMS.Spec.Replicas, 0) != ptr.Deref(p.newMS.Status.UpToDateReplicas, 0) {
+		return true
+	}
 	for _, m := range p.machines {
-		if _, ok := m.Annotations[clusterv1.UpdateInProgressAnnotation]; ok {
+		if inplace.IsUpdateInProgress(m) {
 			return true
 		}
+	}
+
+	// We are also checking AvailableReplicas because we want to make sure that we wait until the
+	// Machine goes back to Available after the in-place update is completed.
+	// If we would not wait for this, the rolloutPlaner would use maxSurge to create an additional Machine.
+	// Note: This also means that if any Machine of the new MachineSet becomes unavailable we are blocking
+	// further progress of the in-place update.
+	if ptr.Deref(p.newMS.Spec.Replicas, 0) != ptr.Deref(p.newMS.Status.AvailableReplicas, 0) {
+		return true
 	}
 	return false
 }

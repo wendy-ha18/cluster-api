@@ -48,6 +48,7 @@ import (
 	"sigs.k8s.io/cluster-api/controlplane/kubeadm/internal"
 	runtimeclient "sigs.k8s.io/cluster-api/exp/runtime/client"
 	"sigs.k8s.io/cluster-api/feature"
+	"sigs.k8s.io/cluster-api/internal/util/inplace"
 	"sigs.k8s.io/cluster-api/internal/util/ssa"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/cache"
@@ -447,7 +448,7 @@ func (r *KubeadmControlPlaneReconciler) reconcile(ctx context.Context, controlPl
 	}
 
 	// Generate Cluster Kubeconfig if needed
-	if result, err := r.reconcileKubeconfig(ctx, controlPlane); !result.IsZero() || err != nil {
+	if result, err := r.reconcileKubeconfig(ctx, controlPlane); err != nil || !result.IsZero() {
 		if err != nil {
 			log.Error(err, "Failed to reconcile Kubeconfig")
 		}
@@ -806,12 +807,6 @@ func (r *KubeadmControlPlaneReconciler) ClusterToKubeadmControlPlane(_ context.C
 }
 
 // syncMachines updates Machines, InfrastructureMachines and KubeadmConfigs to propagate in-place mutable fields from KCP.
-// Note: It also cleans up managed fields of all Machines so that Machines that were
-// created/patched before (< v1.4.0) the controller adopted Server-Side-Apply (SSA) can also work with SSA.
-// Note: For InfrastructureMachines and KubeadmConfigs it also drops ownership of "metadata.labels" and
-// "metadata.annotations" from "manager" so that "capi-kubeadmcontrolplane" can own these fields and can work with SSA.
-// Otherwise, fields would be co-owned by our "old" "manager" and "capi-kubeadmcontrolplane" and then we would not be
-// able to e.g. drop labels and annotations.
 func (r *KubeadmControlPlaneReconciler) syncMachines(ctx context.Context, controlPlane *internal.ControlPlane) error {
 	patchHelpers := map[string]*patch.Helper{}
 	for machineName := range controlPlane.Machines {
@@ -1045,6 +1040,16 @@ func reconcileMachineUpToDateCondition(_ context.Context, controlPlane *internal
 			})
 			continue
 		}
+
+		if inplace.IsUpdateInProgress(machine) {
+			conditions.Set(machine, metav1.Condition{
+				Type:   clusterv1.MachineUpToDateCondition,
+				Status: metav1.ConditionFalse,
+				Reason: clusterv1.MachineUpToDateUpdatingReason,
+			})
+			continue
+		}
+
 		conditions.Set(machine, metav1.Condition{
 			Type:   clusterv1.MachineUpToDateCondition,
 			Status: metav1.ConditionTrue,
