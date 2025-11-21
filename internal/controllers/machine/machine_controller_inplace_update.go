@@ -19,6 +19,7 @@ package machine
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -35,6 +36,7 @@ import (
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/internal/hooks"
+	"sigs.k8s.io/cluster-api/util/cache"
 )
 
 // reconcileInPlaceUpdate handles the in-place update workflow for a Machine.
@@ -65,7 +67,7 @@ func (r *Reconciler) reconcileInPlaceUpdate(ctx context.Context, s *scope) (ctrl
 
 	// If hook is not pending, we're waiting for the owner controller to mark it as pending.
 	if !hasUpdateMachinePending {
-		log.Info("In-place update annotation is set, waiting for UpdateMachine hook to be marked as pending")
+		log.Info("Machine marked for in-place update, waiting for owning controller to mark UpdateMachine hook as pending")
 		return ctrl.Result{}, nil
 	}
 
@@ -75,6 +77,11 @@ func (r *Reconciler) reconcileInPlaceUpdate(ctx context.Context, s *scope) (ctrl
 	}
 	if !ptr.Deref(s.machine.Status.Initialization.BootstrapDataSecretCreated, false) {
 		log.V(5).Info("Bootstrap data secret not yet created, skipping in-place update")
+		return ctrl.Result{}, nil
+	}
+
+	if !s.machine.Status.NodeRef.IsDefined() {
+		log.V(5).Info("Machine status.nodeRef is not yet set, skipping in-place update")
 		return ctrl.Result{}, nil
 	}
 
@@ -109,7 +116,6 @@ func (r *Reconciler) reconcileInPlaceUpdate(ctx context.Context, s *scope) (ctrl
 		return result, nil
 	}
 
-	log.Info("In-place update completed successfully")
 	if err := r.completeInPlaceUpdate(ctx, s); err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "failed to complete in-place update")
 	}
@@ -143,13 +149,18 @@ func (r *Reconciler) callUpdateMachineHook(ctx context.Context, s *scope) (ctrl.
 	if err != nil {
 		return ctrl.Result{}, "", err
 	}
-
 	if len(extensions) == 0 {
 		return ctrl.Result{}, "", errors.New("no extensions registered for UpdateMachine hook")
 	}
-
 	if len(extensions) > 1 {
-		return ctrl.Result{}, "", errors.Errorf("multiple extensions registered for UpdateMachine hook: only one extension is supported, found %d extensions: %v", len(extensions), extensions)
+		return ctrl.Result{}, "", errors.Errorf("found multiple UpdateMachine hooks (%s): only one hook is supported", strings.Join(extensions, ","))
+	}
+
+	if cacheEntry, ok := r.hookCache.Has(cache.NewHookEntryKey(s.machine, runtimehooksv1.UpdateMachine)); ok {
+		if requeueAfter, requeue := cacheEntry.ShouldRequeue(time.Now()); requeue {
+			log.V(5).Info(fmt.Sprintf("Skip calling UpdateMachine hook, retry after %s", requeueAfter))
+			return ctrl.Result{RequeueAfter: requeueAfter}, cacheEntry.ResponseMessage, nil
+		}
 	}
 
 	// Note: When building request message, dropping status; Runtime extension should treat UpdateMachine
@@ -173,7 +184,9 @@ func (r *Reconciler) callUpdateMachineHook(ctx context.Context, s *scope) (ctrl.
 
 	if response.GetRetryAfterSeconds() != 0 {
 		log.Info(fmt.Sprintf("UpdateMachine hook requested retry after %d seconds", response.GetRetryAfterSeconds()))
-		return ctrl.Result{RequeueAfter: time.Duration(response.GetRetryAfterSeconds()) * time.Second}, response.GetMessage(), nil
+		requeueAfter := time.Duration(response.RetryAfterSeconds) * time.Second
+		r.hookCache.Add(cache.NewHookEntry(s.machine, runtimehooksv1.UpdateMachine, time.Now().Add(requeueAfter), response.GetMessage()))
+		return ctrl.Result{RequeueAfter: requeueAfter}, response.GetMessage(), nil
 	}
 
 	log.Info("UpdateMachine hook completed successfully")
@@ -203,11 +216,13 @@ func (r *Reconciler) completeInPlaceUpdate(ctx context.Context, s *scope) error 
 		}
 	}
 
-	if err := hooks.MarkAsDone(ctx, r.Client, s.machine, runtimehooksv1.UpdateMachine); err != nil {
+	// Note: This call will not update the resourceVersion on machine, so that the patchHelper in the main
+	// Reconcile func won't get a conflict.
+	if err := hooks.MarkAsDone(ctx, r.Client, s.machine, false, runtimehooksv1.UpdateMachine); err != nil {
 		return err
 	}
 
-	log.Info("In place upgrade completed!")
+	log.Info("Completed in-place update")
 	return nil
 }
 
@@ -223,6 +238,8 @@ func (r *Reconciler) removeInPlaceUpdateAnnotation(ctx context.Context, obj clie
 		return errors.Wrapf(err, "failed to remove %s annotation from object %s", clusterv1.UpdateInProgressAnnotation, klog.KObj(obj))
 	}
 
+	// Note: DeepCopy object to not modify the passed-in object which can lead to conflict errors later on.
+	obj = obj.DeepCopyObject().(client.Object)
 	orig := obj.DeepCopyObject().(client.Object)
 	delete(annotations, clusterv1.UpdateInProgressAnnotation)
 	obj.SetAnnotations(annotations)

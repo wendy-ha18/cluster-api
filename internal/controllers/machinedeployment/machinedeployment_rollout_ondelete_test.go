@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -29,7 +28,6 @@ import (
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
-	"k8s.io/klog/v2/textlogger"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -45,6 +43,7 @@ func TestReconcileOldMachineSetsOnDelete(t *testing.T) {
 		newMachineSet     *clusterv1.MachineSet
 		oldMachineSets    []*clusterv1.MachineSet
 		expectScaleIntent map[string]int32
+		expectedNotes     map[string][]string
 		error             error
 	}{
 		{
@@ -98,6 +97,7 @@ func TestReconcileOldMachineSetsOnDelete(t *testing.T) {
 			expectScaleIntent: map[string]int32{
 				// no new intent for old MS
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name: "OnDelete strategy: scale down oldMSs when machines have been deleted",
@@ -152,6 +152,10 @@ func TestReconcileOldMachineSetsOnDelete(t *testing.T) {
 				"ms1": 2, // scale down by one, one machines has been deleted
 				"ms2": 0, // scale down by one, one machines has been deleted
 			},
+			expectedNotes: map[string][]string{
+				"ms1": {"scale down to align to existing Machines"},
+				"ms2": {"scale down to align to existing Machines"},
+			},
 		},
 		{
 			name: "OnDelete strategy: scale down oldMSs when md has been scaled down",
@@ -205,6 +209,10 @@ func TestReconcileOldMachineSetsOnDelete(t *testing.T) {
 				// new intent for old MS
 				"ms1": 0, // scale down by one, 1 exceeding machine removed from ms1
 				"ms2": 1, // scale down by one, 1 exceeding machine removed from ms2
+			},
+			expectedNotes: map[string][]string{
+				"ms1": {"scale down to align MachineSet spec.replicas to MachineDeployment spec.replicas"},
+				"ms2": {"scale down to align MachineSet spec.replicas to MachineDeployment spec.replicas"},
 			},
 		},
 		{
@@ -263,6 +271,10 @@ func TestReconcileOldMachineSetsOnDelete(t *testing.T) {
 				"ms1": 0, // scale down by one, 1 exceeding machine removed from ms1
 				"ms2": 1, // scale down by one, 1 exceeding machine removed from ms2
 			},
+			expectedNotes: map[string][]string{
+				"ms1": {"scale down to align MachineSet spec.replicas to MachineDeployment spec.replicas"},
+				"ms2": {"scale down to align MachineSet spec.replicas to MachineDeployment spec.replicas"},
+			},
 		},
 		{
 			name: "OnDelete strategy: scale down oldMSs when md has been scaled down keeps into account deleted machines",
@@ -317,12 +329,16 @@ func TestReconcileOldMachineSetsOnDelete(t *testing.T) {
 				"ms1": 0, // scale down by one, one machines has been deleted
 				"ms2": 1, // scale down by one, 1 exceeding machine removed from ms1
 			},
+			expectedNotes: map[string][]string{
+				"ms1": {"scale down to align to existing Machines"},
+				"ms2": {"scale down to align MachineSet spec.replicas to MachineDeployment spec.replicas"},
+			},
 		},
 	}
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
 			g := NewWithT(t)
-			planner := newRolloutPlanner()
+			planner := newRolloutPlanner(nil, nil, nil)
 			planner.scaleIntents = tt.scaleIntent
 			planner.md = tt.machineDeployment
 			planner.newMS = tt.newMachineSet
@@ -330,6 +346,7 @@ func TestReconcileOldMachineSetsOnDelete(t *testing.T) {
 
 			planner.reconcileOldMachineSetsOnDelete(ctx)
 			g.Expect(planner.scaleIntents).To(Equal(tt.expectScaleIntent), "unexpected scaleIntents")
+			g.Expect(planner.notes).To(Equal(tt.expectedNotes), "unexpected notes")
 		})
 	}
 }
@@ -356,7 +373,7 @@ type onDeleteSequenceTestCase struct {
 	// if this list contains new machines names (machine names not in currentMachineNames), it implies those machines have been created during a rollout;
 	// please name new machines names as "mX" where X is a progressive number starting after the max number in currentMachineNames (do not skip numbers),
 	// e.g. desiredMachineNames "m4","m5","m6" (desired machine names after a regular rollout of a MD with currentMachineNames "m1","m2","m3")
-	// e.g. desiredMachineNames "m1","m2","m3" (desired machine names after rollout performed using in-place upgrade for an MD with currentMachineNames "m1","m2","m3")
+	// e.g. desiredMachineNames "m1","m2","m3" (desired machine names after rollout performed using in-place update for an MD with currentMachineNames "m1","m2","m3")
 	desiredMachineNames []string
 
 	// maxUserUnavailable define the maximum numbers of unavailable machines a user want to have in the system.
@@ -390,9 +407,6 @@ type onDeleteSequenceTestCase struct {
 }
 
 func Test_OnDeleteSequences(t *testing.T) {
-	ctx := context.Background()
-	ctx = ctrl.LoggerInto(ctx, textlogger.NewLogger(textlogger.NewConfig(textlogger.Verbosity(5), textlogger.Output(os.Stdout))))
-
 	tests := []onDeleteSequenceTestCase{
 		{ // delete 1
 			name:                "3 replicas, maxUserUnavailable 1",
@@ -553,7 +567,7 @@ func runOnDeleteTestCase(ctx context.Context, t *testing.T, tt onDeleteSequenceT
 	desired := computeDesiredRolloutScope(current, tt.desiredMachineNames)
 
 	// Log initial state
-	fLogger.Logf("[Test] Initial state\n%s", current)
+	fLogger.Logf("[Test] Initial state\n%s", current.summary())
 	random := ""
 	if tt.randomControllerOrder {
 		random = fmt.Sprintf(", random(%d)", tt.seed)
@@ -577,10 +591,9 @@ func runOnDeleteTestCase(ctx context.Context, t *testing.T, tt onDeleteSequenceT
 			task := taskList[taskID]
 			if task == "md" {
 				fLogger.Logf("[MD controller] Iteration %d, Reconcile md", i)
-				fLogger.Logf("[MD controller] - Input to rollout planner\n%s", current)
 
 				// Running a small subset of MD reconcile (the rollout logic and a bit of setReplicas)
-				p := newRolloutPlanner()
+				p := newRolloutPlanner(nil, nil, nil)
 				p.overrideComputeDesiredMS = func(ctx context.Context, deployment *clusterv1.MachineDeployment, currentNewMS *clusterv1.MachineSet) (*clusterv1.MachineSet, error) {
 					log := ctrl.LoggerFrom(ctx)
 					desiredNewMS := currentNewMS
@@ -618,7 +631,7 @@ func runOnDeleteTestCase(ctx context.Context, t *testing.T, tt onDeleteSequenceT
 				current.machineDeployment.Status.AvailableReplicas = mdutil.GetAvailableReplicaCountForMachineSets(current.machineSets)
 
 				// Log state after this reconcile
-				fLogger.Logf("[MD controller] - Result of rollout planner\n%s", current)
+				fLogger.Logf("[MD controller] - Result of rollout planner\n%s", current.rolloutPlannerResultSummary(p))
 			}
 
 			// Simulate the user deleting machines not upToDate; in order to make this realistic deletion will be performed
@@ -666,7 +679,7 @@ func runOnDeleteTestCase(ctx context.Context, t *testing.T, tt onDeleteSequenceT
 			// Run mutators faking MS controllers
 			for _, ms := range current.machineSets {
 				if ms.Name == task {
-					fLogger.Logf("[MS controller] Iteration %d, Reconcile %s, %s", i, ms.Name, msLog(ms, current.machineSetMachines[ms.Name]))
+					fLogger.Logf("[MS controller] Iteration %d, Reconcile %s", i, current.machineSetSummary(ms))
 					err := machineSetControllerMutator(fLogger, ms, current)
 					g.Expect(err).ToNot(HaveOccurred())
 					break
@@ -686,7 +699,7 @@ func runOnDeleteTestCase(ctx context.Context, t *testing.T, tt onDeleteSequenceT
 
 		// Check if we are at the desired state
 		if current.Equal(desired) {
-			fLogger.Logf("[Test] Final state\n%s", current)
+			fLogger.Logf("[Test] Final state\n%s", current.summary())
 			break
 		}
 
@@ -696,7 +709,7 @@ func runOnDeleteTestCase(ctx context.Context, t *testing.T, tt onDeleteSequenceT
 			// NOTE: the following can be used to set a breakpoint for debugging why the system is not reaching desired state after maxIterations (to check what is not yet equal)
 			current.Equal(desired)
 			// Log desired state we never reached
-			fLogger.Logf("[Test] Desired state\n%s", desired)
+			fLogger.Logf("[Test] Desired state\n%s", desired.summary())
 			g.Fail(fmt.Sprintf("Failed to reach desired state in %d iterations", maxIterations))
 		}
 	}

@@ -38,7 +38,6 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -54,6 +53,7 @@ import (
 	"sigs.k8s.io/cluster-api/internal/hooks"
 	topologynames "sigs.k8s.io/cluster-api/internal/topology/names"
 	clientutil "sigs.k8s.io/cluster-api/internal/util/client"
+	capicontrollerutil "sigs.k8s.io/cluster-api/internal/util/controller"
 	"sigs.k8s.io/cluster-api/internal/util/inplace"
 	"sigs.k8s.io/cluster-api/internal/util/ssa"
 	"sigs.k8s.io/cluster-api/util"
@@ -126,33 +126,26 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 		return err
 	}
 
-	err = ctrl.NewControllerManagedBy(mgr).
+	err = capicontrollerutil.NewControllerManagedBy(mgr, predicateLog).
 		For(&clusterv1.MachineSet{}).
-		Owns(&clusterv1.Machine{}, builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog))).
+		Owns(&clusterv1.Machine{}).
 		// Watches enqueues MachineSet for corresponding Machine resources, if no managed controller reference (owner) exists.
 		Watches(
 			&clusterv1.Machine{},
 			handler.EnqueueRequestsFromMapFunc(r.MachineToMachineSets),
-			builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog)),
 		).
 		Watches(
 			&clusterv1.MachineDeployment{},
 			handler.EnqueueRequestsFromMapFunc(mdToMachineSets),
-			builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog)),
 		).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue)).
 		Watches(
 			&clusterv1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(clusterToMachineSets),
-			builder.WithPredicates(
-				// TODO: should this wait for Cluster.Status.InfrastructureReady similar to Infra Machine resources?
-				predicates.All(mgr.GetScheme(), predicateLog,
-					predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog),
-					predicates.ClusterPausedTransitions(mgr.GetScheme(), predicateLog),
-					predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue),
-				),
-			),
+			// TODO: should this wait for Cluster.Status.InfrastructureReady similar to Infra Machine resources?
+			predicates.ClusterPausedTransitions(mgr.GetScheme(), predicateLog),
+			predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue),
 		).
 		WatchesRawSource(r.ClusterCache.GetClusterSource("machineset", clusterToMachineSets)).
 		Complete(r)
@@ -228,11 +221,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (retres ct
 		}
 		if err := patchMachineSet(ctx, patchHelper, s.machineSet, patchOpts...); err != nil {
 			reterr = kerrors.NewAggregate([]error{reterr, err})
-		}
-
-		if reterr != nil {
-			retres = ctrl.Result{}
-			return
 		}
 
 		// Adjust requeue when scaling up
@@ -357,7 +345,9 @@ func (r *Reconciler) triggerInPlaceUpdate(ctx context.Context, s *scope) (ctrl.R
 	errs := []error{}
 	machinesTriggeredInPlace := []*clusterv1.Machine{}
 	for _, machine := range s.machines {
-		// If a machine is not updating in place, or if the in place upgrade has been already triggered, no-op
+		log := log.WithValues("Machine", klog.KObj(machine))
+
+		// If a machine is not updating in place, or if the in-place update has been already triggered, no-op
 		if _, ok := machine.Annotations[clusterv1.UpdateInProgressAnnotation]; !ok || hooks.IsPending(runtimehooksv1.UpdateMachine, machine) {
 			continue
 		}
@@ -384,7 +374,7 @@ func (r *Reconciler) triggerInPlaceUpdate(ctx context.Context, s *scope) (ctrl.R
 			} else {
 				// If this MachineSet is not accepting anymore machines from other MS (e.g. because of MD spec changes),
 				// then drop the PendingAcknowledgeMove annotation; this machine will be treated as any other machine and either
-				// deleted or moved to another MS after completing the in-place upgrade.
+				// deleted or moved to another MS after completing the in-place update.
 				delete(machine.Annotations, clusterv1.PendingAcknowledgeMoveAnnotation)
 			}
 		}
@@ -403,18 +393,18 @@ func (r *Reconciler) triggerInPlaceUpdate(ctx context.Context, s *scope) (ctrl.R
 		//       have to ensure we preserve PendingHooksAnnotation on existing Machines in MachineSet and that would lead to race
 		//       conditions when the Machine controller tries to remove the annotation and MachineSet adds it back.
 		if err := r.Client.Patch(ctx, machine, client.MergeFrom(orig)); err != nil {
-			errs = append(errs, errors.Wrapf(err, "failed to start in-place update for Machine %s", klog.KObj(machine)))
+			errs = append(errs, errors.Wrapf(err, "failed to complete triggering in-place update for Machine %s", klog.KObj(machine)))
 			continue
 		}
 
 		machinesTriggeredInPlace = append(machinesTriggeredInPlace, machine)
-		log.Info("Completed triggering in-place update", "Machine", klog.KObj(machine))
+		log.Info(fmt.Sprintf("Completed triggering in-place update for Machine %s", machine.Name))
 		r.recorder.Event(machine, corev1.EventTypeNormal, "SuccessfulStartInPlaceUpdate", "Machine starting in-place update")
 	}
 
 	// Wait until the cache observed the Machine with PendingHooksAnnotation to ensure subsequent reconciles
 	// will observe it as well and won't repeatedly call the logic to trigger in-place update.
-	if err := clientutil.WaitForCacheToBeUpToDate(ctx, r.Client, "starting in-place updates", machinesTriggeredInPlace...); err != nil {
+	if err := clientutil.WaitForCacheToBeUpToDate(ctx, r.Client, "complete triggering in-place update", machinesTriggeredInPlace...); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
@@ -482,19 +472,19 @@ func (r *Reconciler) completeMoveMachine(ctx context.Context, s *scope, currentM
 	// Write InfraMachine.
 	// Note: Let's update InfraMachine first because that is the call that is most likely to fail.
 	if err := ssa.Patch(ctx, r.Client, machineSetManagerName, desiredInfraMachine); err != nil {
-		return errors.Wrapf(err, "failed to update InfraMachine %s", klog.KObj(desiredInfraMachine))
+		return errors.Wrapf(err, "failed to complete triggering in-place update for Machine %s", klog.KObj(desiredMachine))
 	}
 
 	// Write BootstrapConfig.
 	if desiredMachine.Spec.Bootstrap.ConfigRef.IsDefined() {
 		if err := ssa.Patch(ctx, r.Client, machineSetManagerName, desiredBootstrapConfig); err != nil {
-			return errors.Wrapf(err, "failed to update BootstrapConfig %s", klog.KObj(desiredBootstrapConfig))
+			return errors.Wrapf(err, "failed to complete triggering in-place update for Machine %s", klog.KObj(desiredMachine))
 		}
 	}
 
 	// Write Machine.
 	if err := ssa.Patch(ctx, r.Client, machineSetManagerName, desiredMachine); err != nil {
-		return errors.Wrap(err, "failed to update Machine")
+		return errors.Wrapf(err, "failed to complete triggering in-place update for Machine %s", klog.KObj(desiredMachine))
 	}
 
 	return nil
@@ -584,7 +574,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result
 			}
 			// Note: We intentionally log after Delete because we want this log line to show up only after DeletionTimestamp has been set.
 			// Also, setting DeletionTimestamp doesn't mean the Machine is actually deleted (deletion takes some time).
-			log.Info("Deleting Machine (MachineSet deleted)", "Machine", klog.KObj(machine))
+			log.Info(fmt.Sprintf("Deleting Machine %s (MachineSet deleted)", machine.Name), "Machine", klog.KObj(machine))
 		}
 	}
 
@@ -669,6 +659,7 @@ func (r *Reconciler) syncMachines(ctx context.Context, s *scope) (ctrl.Result, e
 			m.Spec.Deletion.NodeDeletionTimeoutSeconds = machineSet.Spec.Template.Spec.Deletion.NodeDeletionTimeoutSeconds
 			m.Spec.Deletion.NodeVolumeDetachTimeoutSeconds = machineSet.Spec.Template.Spec.Deletion.NodeVolumeDetachTimeoutSeconds
 			m.Spec.MinReadySeconds = machineSet.Spec.Template.Spec.MinReadySeconds
+			m.Spec.Taints = machineSet.Spec.Template.Spec.Taints
 
 			if err := patchHelper.Patch(ctx, m); err != nil {
 				return ctrl.Result{}, err
@@ -749,10 +740,10 @@ func (r *Reconciler) syncReplicas(ctx context.Context, s *scope) (ctrl.Result, e
 	case diff < 0:
 		// If there are not enough Machines, create missing Machines unless Machine creation is disabled.
 		machinesToAdd := -diff
-		log.Info(fmt.Sprintf("MachineSet is scaling up to %d replicas by creating %d machines", *(ms.Spec.Replicas), machinesToAdd), "replicas", *(ms.Spec.Replicas), "machineCount", len(machines))
+		log.Info(fmt.Sprintf("MachineSet is scaling up to %d replicas by creating %d Machines", *(ms.Spec.Replicas), machinesToAdd), "replicas", *(ms.Spec.Replicas), "machineCount", len(machines))
 		if ms.Annotations != nil {
 			if value, ok := ms.Annotations[clusterv1.DisableMachineCreateAnnotation]; ok && value == "true" {
-				log.Info("Automatic creation of new machines disabled for machine set")
+				log.Info("Automatic creation of new machines disabled for MachineSet")
 				return ctrl.Result{}, nil
 			}
 		}
@@ -775,7 +766,7 @@ func (r *Reconciler) syncReplicas(ctx context.Context, s *scope) (ctrl.Result, e
 			}
 		}
 		if notAcknowledgeMoveReplicas.Len() > 0 {
-			log.Info(fmt.Sprintf("Replicas %s moved from an old MachineSet still pending acknowledge from MachineDeployment", notAcknowledgeMoveReplicas.UnsortedList()))
+			log.V(5).Info(fmt.Sprintf("Machines %s moved from an old MachineSet still pending acknowledge from MachineDeployment", notAcknowledgeMoveReplicas.UnsortedList()))
 		}
 
 		machinesToDeleteOrMove := len(machines) - notAcknowledgeMoveReplicas.Len() - int(ptr.Deref(ms.Spec.Replicas, 0))
@@ -888,12 +879,12 @@ func (r *Reconciler) createMachines(ctx context.Context, s *scope, machinesToAdd
 		}
 
 		machinesAdded = append(machinesAdded, machine)
-		log.Info(fmt.Sprintf("Machine created (scale up, creating %d of %d)", i+1, machinesToAdd), "Machine", klog.KObj(machine))
+		log.Info(fmt.Sprintf("Machine %s created (scale up, creating %d of %d)", machine.Name, i+1, machinesToAdd), "Machine", klog.KObj(machine))
 		r.recorder.Eventf(ms, corev1.EventTypeNormal, "SuccessfulCreate", "Created Machine %q", machine.Name)
 	}
 
 	// Wait for cache update to ensure following reconcile gets latest change.
-	return ctrl.Result{}, clientutil.WaitForCacheToBeUpToDate(ctx, r.Client, "Machine creation", machinesAdded...)
+	return ctrl.Result{}, clientutil.WaitForObjectsToBeAddedToTheCache(ctx, r.Client, "Machine creation", machinesAdded...)
 }
 
 func (r *Reconciler) deleteMachines(ctx context.Context, s *scope, machinesToDelete int) (ctrl.Result, error) {
@@ -933,7 +924,7 @@ func (r *Reconciler) deleteMachines(ctx context.Context, s *scope, machinesToDel
 			}
 
 			machinesDeleted = append(machinesDeleted, machine)
-			log.Info(fmt.Sprintf("Deleting Machine (scale down, deleting %d of %d)", i+1, machinesToDelete))
+			log.Info(fmt.Sprintf("Machine %s deleting (scale down, deleting %d of %d)", machine.Name, i+1, machinesToDelete))
 			r.recorder.Eventf(ms, corev1.EventTypeNormal, "SuccessfulDelete", "Deleted Machine %q", machine.Name)
 		} else {
 			log.Info(fmt.Sprintf("Waiting for Machine to be deleted (scale down, deleting %d of %d)", i+1, machinesToDelete))
@@ -941,7 +932,7 @@ func (r *Reconciler) deleteMachines(ctx context.Context, s *scope, machinesToDel
 	}
 
 	// Wait for cache update to ensure following reconcile gets latest change.
-	if err := clientutil.WaitForObjectsToBeDeletedFromTheCache(ctx, r.Client, "Machine deletion", machinesDeleted...); err != nil {
+	if err := clientutil.WaitForObjectsToBeDeletedFromTheCache(ctx, r.Client, "Machine deletion (scale down)", machinesDeleted...); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
@@ -997,6 +988,11 @@ func (r *Reconciler) startMoveMachines(ctx context.Context, s *scope, targetMSNa
 			continue
 		}
 
+		// Make sure we are not moving machines not yet provisioned.
+		if !machine.Status.NodeRef.IsDefined() {
+			continue
+		}
+
 		// Note. Machines with the DeleteMachineAnnotation are going to be moved and the new MS
 		//       will take care of fulfilling this intent as soon as it scales down.
 		// Note. Also Machines marked as unhealthy by MHC are going to be moved, because otherwise
@@ -1008,6 +1004,8 @@ func (r *Reconciler) startMoveMachines(ctx context.Context, s *scope, targetMSNa
 		if !machine.DeletionTimestamp.IsZero() {
 			continue
 		}
+
+		log.Info(fmt.Sprintf("Triggering in-place update for Machine %s (by moving to MachineSet %s)", machine.Name, targetMS.Name))
 
 		// Perform the first part of a move operation, the part under the responsibility of the oldMS.
 		orig := machine.DeepCopy()
@@ -1046,8 +1044,7 @@ func (r *Reconciler) startMoveMachines(ctx context.Context, s *scope, targetMSNa
 		//       UpdateInProgressAnnotation on existing Machines and that would lead to race conditions when
 		//       the Machine controller tries to remove the annotation and then the MachineSet controller adds it back.
 		if err := r.Client.Patch(ctx, machine, client.MergeFrom(orig)); err != nil {
-			log.Error(err, "Failed to start moving Machine")
-			errs = append(errs, errors.Wrapf(err, "failed to start moving Machine %s", klog.KObj(machine)))
+			errs = append(errs, errors.Wrapf(err, "failed to trigger in-place update for Machine %s by moving to MachineSet %s", klog.KObj(machine), klog.KObj(targetMS)))
 			continue
 		}
 		machinesMoved = append(machinesMoved, machine)
@@ -1153,6 +1150,7 @@ func (r *Reconciler) computeDesiredMachine(machineSet *clusterv1.MachineSet, exi
 	desiredMachine.Spec.Deletion.NodeDeletionTimeoutSeconds = machineSet.Spec.Template.Spec.Deletion.NodeDeletionTimeoutSeconds
 	desiredMachine.Spec.Deletion.NodeVolumeDetachTimeoutSeconds = machineSet.Spec.Template.Spec.Deletion.NodeVolumeDetachTimeoutSeconds
 	desiredMachine.Spec.MinReadySeconds = machineSet.Spec.Template.Spec.MinReadySeconds
+	desiredMachine.Spec.Taints = machineSet.Spec.Template.Spec.Taints
 
 	return desiredMachine, nil
 }
@@ -1405,7 +1403,7 @@ func (r *Reconciler) reconcileV1Beta1Status(ctx context.Context, s *scope) error
 		// are actually provisioned (vs reporting completed immediately after the last machine object is created). This convention is also used by KCP.
 		if ms.Status.Deprecated.V1Beta1.ReadyReplicas == currentReplicas {
 			if v1beta1conditions.IsFalse(ms, clusterv1.ResizedV1Beta1Condition) {
-				log.Info("All the replicas are ready", "replicas", ms.Status.Deprecated.V1Beta1.ReadyReplicas)
+				log.V(5).Info("All the replicas are ready", "replicas", ms.Status.Deprecated.V1Beta1.ReadyReplicas)
 			}
 			v1beta1conditions.MarkTrue(ms, clusterv1.ResizedV1Beta1Condition)
 		}
@@ -1666,7 +1664,7 @@ func (r *Reconciler) reconcileUnhealthyMachines(ctx context.Context, s *scope) (
 		}
 		// Note: We intentionally log after Delete because we want this log line to show up only after DeletionTimestamp has been set.
 		// Also, setting DeletionTimestamp doesn't mean the Machine is actually deleted (deletion takes some time).
-		log.Info("Deleting Machine (remediating unhealthy Machine)", "Machine", klog.KObj(m))
+		log.Info(fmt.Sprintf("Deleting Machine %s (remediating unhealthy Machine)", m.Name), "Machine", klog.KObj(m))
 	}
 	if len(errs) > 0 {
 		return ctrl.Result{}, errors.Wrapf(kerrors.NewAggregate(errs), "failed to delete unhealthy Machines")

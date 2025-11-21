@@ -54,6 +54,7 @@ import (
 	topologynames "sigs.k8s.io/cluster-api/internal/topology/names"
 	"sigs.k8s.io/cluster-api/internal/topology/ownerrefs"
 	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/cache"
 	"sigs.k8s.io/cluster-api/util/conversion"
 	"sigs.k8s.io/cluster-api/util/test/builder"
 )
@@ -1062,11 +1063,11 @@ func TestComputeControlPlaneVersion(t *testing.T) {
 
 	catalog := runtimecatalog.New()
 	_ = runtimehooksv1.AddToCatalog(catalog)
+	beforeClusterUpgradeGVH, _ := catalog.GroupVersionHook(runtimehooksv1.BeforeClusterUpgrade)
+	beforeControlPlaneUpgradeGVH, _ := catalog.GroupVersionHook(runtimehooksv1.BeforeControlPlaneUpgrade)
+	beforeWorkersUpgradeGVH, _ := catalog.GroupVersionHook(runtimehooksv1.BeforeWorkersUpgrade)
+	afterWorkersUpgradeGVH, _ := catalog.GroupVersionHook(runtimehooksv1.AfterWorkersUpgrade)
 
-	beforeClusterUpgradeGVH, err := catalog.GroupVersionHook(runtimehooksv1.BeforeClusterUpgrade)
-	if err != nil {
-		panic("unable to compute GVH")
-	}
 	nonBlockingBeforeClusterUpgradeResponse := &runtimehooksv1.BeforeClusterUpgradeResponse{
 		CommonRetryResponse: runtimehooksv1.CommonRetryResponse{
 			CommonResponse: runtimehooksv1.CommonResponse{
@@ -1090,10 +1091,6 @@ func TestComputeControlPlaneVersion(t *testing.T) {
 		},
 	}
 
-	beforeControlPlaneUpgradeGVH, err := catalog.GroupVersionHook(runtimehooksv1.BeforeControlPlaneUpgrade)
-	if err != nil {
-		panic("unable to compute GVH")
-	}
 	nonBlockingBeforeControlPlaneUpgradeResponse := &runtimehooksv1.BeforeControlPlaneUpgradeResponse{
 		CommonRetryResponse: runtimehooksv1.CommonRetryResponse{
 			CommonResponse: runtimehooksv1.CommonResponse{
@@ -1117,10 +1114,6 @@ func TestComputeControlPlaneVersion(t *testing.T) {
 		},
 	}
 
-	beforeWorkersUpgradeGVH, err := catalog.GroupVersionHook(runtimehooksv1.BeforeWorkersUpgrade)
-	if err != nil {
-		panic("unable to compute GVH")
-	}
 	nonBlockingBeforeWorkersUpgradeResponse := &runtimehooksv1.BeforeWorkersUpgradeResponse{
 		CommonRetryResponse: runtimehooksv1.CommonRetryResponse{
 			CommonResponse: runtimehooksv1.CommonResponse{
@@ -1144,10 +1137,6 @@ func TestComputeControlPlaneVersion(t *testing.T) {
 		},
 	}
 
-	afterWorkersUpgradeGVH, err := catalog.GroupVersionHook(runtimehooksv1.AfterWorkersUpgrade)
-	if err != nil {
-		panic("unable to compute GVH")
-	}
 	nonBlockingAfterWorkersUpgradeResponse := &runtimehooksv1.AfterWorkersUpgradeResponse{
 		CommonRetryResponse: runtimehooksv1.CommonRetryResponse{
 			CommonResponse: runtimehooksv1.CommonResponse{
@@ -1705,6 +1694,12 @@ func TestComputeControlPlaneVersion(t *testing.T) {
 
 			runtimeClient := fakeruntimeclient.NewRuntimeClientBuilder().
 				WithCatalog(catalog).
+				WithGetAllExtensionResponses(map[runtimecatalog.GroupVersionHook][]string{
+					beforeClusterUpgradeGVH:      {"foo"},
+					beforeControlPlaneUpgradeGVH: {"foo"},
+					beforeWorkersUpgradeGVH:      {"foo"},
+					afterWorkersUpgradeGVH:       {"foo"},
+				}).
 				WithCallAllExtensionResponses(map[runtimecatalog.GroupVersionHook]runtimehooksv1.ResponseObject{
 					beforeClusterUpgradeGVH:      tt.beforeClusterUpgradeResponse,
 					beforeControlPlaneUpgradeGVH: tt.beforeControlPlaneUpgradeResponse,
@@ -1719,6 +1714,7 @@ func TestComputeControlPlaneVersion(t *testing.T) {
 			r := &generator{
 				Client:        fakeClient,
 				RuntimeClient: runtimeClient,
+				hookCache:     cache.New[cache.HookEntry](cache.HookCacheDefaultTTL),
 			}
 			version, err := r.computeControlPlaneVersion(ctx, s)
 			if tt.wantErr {
@@ -2969,7 +2965,7 @@ func TestComputeMachineDeploymentVersion(t *testing.T) {
 
 			e := generator{}
 
-			version, err := e.computeMachineDeploymentVersion(s, tt.machineDeploymentTopology, tt.currentMachineDeploymentState)
+			version, err := e.computeMachineDeploymentVersion(ctx, s, tt.machineDeploymentTopology, tt.currentMachineDeploymentState)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(version).To(Equal(tt.expectedVersion))
 
@@ -3214,7 +3210,7 @@ func TestComputeMachinePoolVersion(t *testing.T) {
 
 			e := generator{}
 
-			version, err := e.computeMachinePoolVersion(s, tt.machinePoolTopology, tt.currentMachinePoolState)
+			version, err := e.computeMachinePoolVersion(ctx, s, tt.machinePoolTopology, tt.currentMachinePoolState)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(version).To(Equal(tt.expectedVersion))
 
@@ -3953,6 +3949,8 @@ func TestGenerate(t *testing.T) {
 			fakeClient,
 			clusterCache,
 			fakeRuntimeClient,
+			cache.New[cache.HookEntry](cache.HookCacheDefaultTTL),
+			cache.New[GenerateUpgradePlanCacheEntry](10*time.Minute),
 		)
 		g.Expect(err).ToNot(HaveOccurred())
 

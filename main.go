@@ -713,6 +713,7 @@ func setupReconcilers(ctx context.Context, mgr ctrl.Manager, watchNamespaces map
 	if err := (&controllers.MachineDeploymentReconciler{
 		Client:           mgr.GetClient(),
 		APIReader:        mgr.GetAPIReader(),
+		RuntimeClient:    runtimeClient,
 		WatchFilterValue: watchFilterValue,
 	}).SetupWithManager(ctx, mgr, concurrency(machineDeploymentConcurrency)); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "MachineDeployment")
@@ -731,22 +732,20 @@ func setupReconcilers(ctx context.Context, mgr ctrl.Manager, watchNamespaces map
 		}
 	}
 
-	if feature.Gates.Enabled(feature.ClusterResourceSet) {
-		if err := (&controllers.ClusterResourceSetReconciler{
-			Client:           mgr.GetClient(),
-			ClusterCache:     clusterCache,
-			WatchFilterValue: watchFilterValue,
-		}).SetupWithManager(ctx, mgr, concurrency(clusterResourceSetConcurrency), partialSecretCache); err != nil {
-			setupLog.Error(err, "Unable to create controller", "controller", "ClusterResourceSet")
-			os.Exit(1)
-		}
-		if err := (&controllers.ClusterResourceSetBindingReconciler{
-			Client:           mgr.GetClient(),
-			WatchFilterValue: watchFilterValue,
-		}).SetupWithManager(ctx, mgr, concurrency(clusterResourceSetConcurrency)); err != nil {
-			setupLog.Error(err, "Unable to create controller", "controller", "ClusterResourceSetBinding")
-			os.Exit(1)
-		}
+	if err := (&controllers.ClusterResourceSetReconciler{
+		Client:           mgr.GetClient(),
+		ClusterCache:     clusterCache,
+		WatchFilterValue: watchFilterValue,
+	}).SetupWithManager(ctx, mgr, concurrency(clusterResourceSetConcurrency), partialSecretCache); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "ClusterResourceSet")
+		os.Exit(1)
+	}
+	if err := (&controllers.ClusterResourceSetBindingReconciler{
+		Client:           mgr.GetClient(),
+		WatchFilterValue: watchFilterValue,
+	}).SetupWithManager(ctx, mgr, concurrency(clusterResourceSetConcurrency)); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "ClusterResourceSetBinding")
+		os.Exit(1)
 	}
 
 	if err := (&controllers.MachineHealthCheckReconciler{

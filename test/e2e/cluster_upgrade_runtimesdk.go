@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blang/semver/v4"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
@@ -203,7 +204,7 @@ func ClusterUpgradeWithRuntimeSDKSpec(ctx context.Context, inputGetter func() Cl
 		// cluster lifecycle by default. Setting defaultAllHandlersToBlocking to true enforces that the test-extension
 		// automatically creates the ConfigMap with blocking preloaded responses.
 		Expect(input.BootstrapClusterProxy.GetClient().Create(ctx,
-			extensionConfig(input.ExtensionConfigName, input.ExtensionServiceNamespace, input.ExtensionServiceName, true, namespaces...))).
+			extensionConfig(input.ExtensionConfigName, input.ExtensionServiceNamespace, input.ExtensionServiceName, true, true, namespaces...))).
 			To(Succeed(), "Failed to create the extension config")
 
 		By("Creating a workload cluster; creation waits for BeforeClusterCreateHook to gate the operation")
@@ -412,11 +413,12 @@ func ClusterUpgradeWithRuntimeSDKSpec(ctx context.Context, inputGetter func() Cl
 		})
 
 		// Check if the AfterClusterUpgrade hook is actually called.
-		hookName := computeHookName("AfterClusterUpgrade", []string{toVersion})
-		Byf("Waiting for %s hook to be called", hookName)
-		Eventually(func(_ Gomega) error {
-			return checkLifecycleHooksCalledAtLeastOnce(ctx, input.BootstrapClusterProxy.GetClient(), clusterResources.Cluster, input.ExtensionConfigName, "AfterClusterUpgrade", []string{toVersion})
-		}, 30*time.Second, 2*time.Second).Should(Succeed(), "%s has not been called", hookName)
+		afterAfterClusterUpgradeTestHandler(ctx,
+			input.BootstrapClusterProxy.GetClient(),
+			clusterResources.Cluster,
+			input.ExtensionConfigName,
+			toVersion, // toVersion of the upgrade.
+		)
 
 		By("Waiting until nodes are ready")
 		workloadProxy := input.BootstrapClusterProxy.GetWorkloadCluster(ctx, namespace.Name, clusterResources.Cluster.Name)
@@ -466,7 +468,7 @@ func ClusterUpgradeWithRuntimeSDKSpec(ctx context.Context, inputGetter func() Cl
 			computeHookName("BeforeClusterCreate", nil):                               "Status: Success, RetryAfterSeconds: 0",
 			computeHookName("AfterControlPlaneInitialized", nil):                      "Success",
 			computeHookName("BeforeClusterUpgrade", []string{fromVersion, toVersion}): "Status: Success, RetryAfterSeconds: 0",
-			computeHookName("AfterClusterUpgrade", []string{toVersion}):               "Success",
+			computeHookName("AfterClusterUpgrade", []string{toVersion}):               "Status: Success, RetryAfterSeconds: 0",
 			computeHookName("BeforeClusterDelete", nil):                               "Status: Success, RetryAfterSeconds: 0",
 		}
 		fromv := fromVersion
@@ -494,7 +496,7 @@ func ClusterUpgradeWithRuntimeSDKSpec(ctx context.Context, inputGetter func() Cl
 		if !input.SkipCleanup {
 			// Delete the extensionConfig first to ensure the BeforeDeleteCluster hook doesn't block deletion.
 			Eventually(func() error {
-				return input.BootstrapClusterProxy.GetClient().Delete(ctx, extensionConfig(input.ExtensionConfigName, input.ExtensionServiceNamespace, input.ExtensionServiceName, true, namespace.Name))
+				return input.BootstrapClusterProxy.GetClient().Delete(ctx, &runtimev1.ExtensionConfig{ObjectMeta: metav1.ObjectMeta{Name: input.ExtensionConfigName}})
 			}, 10*time.Second, 1*time.Second).Should(Succeed(), "Deleting ExtensionConfig failed")
 
 			Byf("Deleting cluster %s", klog.KObj(clusterResources.Cluster))
@@ -629,7 +631,7 @@ func machineSetPreflightChecksTest(ctx context.Context, c client.Client, cluster
 // We make sure this cluster-wide object does not conflict with others by using a random generated
 // name and a NamespaceSelector selecting on the namespace of the current test.
 // Thus, this object is "namespaced" to the current test even though it's a cluster-wide object.
-func extensionConfig(name, extensionServiceNamespace, extensionServiceName string, defaultAllHandlersToBlocking bool, namespaces ...string) *runtimev1.ExtensionConfig {
+func extensionConfig(name, extensionServiceNamespace, extensionServiceName string, disableInPlaceUpdates, defaultAllHandlersToBlocking bool, namespaces ...string) *runtimev1.ExtensionConfig {
 	cfg := &runtimev1.ExtensionConfig{
 		ObjectMeta: metav1.ObjectMeta{
 			// Note: We have to use a constant name here as we have to be able to reference it in the ClusterClass
@@ -650,6 +652,7 @@ func extensionConfig(name, extensionServiceNamespace, extensionServiceName strin
 			},
 			Settings: map[string]string{
 				"extensionConfigName":          name,
+				"disableInPlaceUpdates":        strconv.FormatBool(disableInPlaceUpdates),
 				"defaultAllHandlersToBlocking": strconv.FormatBool(defaultAllHandlersToBlocking),
 			},
 		},
@@ -1042,6 +1045,32 @@ func afterWorkersUpgradeTestHandler(ctx context.Context, c client.Client, cluste
 	Byf("AfterWorkersUpgrade to %s unblocked", workersVersion)
 }
 
+// afterAfterClusterUpgradeTestHandler calls runtimeHookTestHandler with a blocking function which returns false
+// if it is possible to upgrade to the next K8s version.
+func afterAfterClusterUpgradeTestHandler(ctx context.Context, c client.Client, cluster *clusterv1.Cluster, extensionConfigName string, topologyVersion string) {
+	hookName := "AfterClusterUpgrade"
+
+	v, err := semver.ParseTolerant(topologyVersion)
+	Expect(err).ToNot(HaveOccurred())
+
+	nextUpgradeCluster := cluster.DeepCopy()
+	v.Minor++
+	nextUpgradeCluster.Spec.Topology.Version = fmt.Sprintf("v%s", v.String())
+
+	isBlockingUpgrade := func() bool {
+		if err := c.Patch(ctx, nextUpgradeCluster, client.MergeFrom(cluster), client.DryRunAll); err != nil {
+			if apierrors.IsInvalid(err) && strings.Contains(err.Error(), fmt.Sprintf("%q hook is still blocking", hookName)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	runtimeHookTestHandler(ctx, c, cluster, extensionConfigName, hookName, []string{topologyVersion}, isBlockingUpgrade, nil)
+
+	Byf("AfterClusterUpgrade to %s unblocked", topologyVersion)
+}
+
 // beforeClusterDeleteHandler calls runtimeHookTestHandler with a blocking function which returns false if the Cluster
 // cannot be found in the API server.
 func beforeClusterDeleteHandler(ctx context.Context, c client.Client, cluster *clusterv1.Cluster, extensionConfigName string) {
@@ -1074,21 +1103,14 @@ func beforeClusterDeleteHandler(ctx context.Context, c client.Client, cluster *c
 func annotationHookTestHandler(ctx context.Context, c client.Client, cluster *clusterv1.Cluster, hook, annotation string, blockingCondition func() bool) {
 	log.Logf("Blocking with the %s annotation hook for 60 seconds", hook)
 
-	expectedBlockingMessage := fmt.Sprintf("hook %q is blocking: annotation [%s] is set", hook, annotation)
+	expectedBlockingMessage := fmt.Sprintf("annotation %s is set", annotation)
 
 	// Check if TopologyReconciledCondition reports if the annotation hook is blocking
 	topologyConditionCheck := func() bool {
 		cluster = framework.GetClusterByName(ctx, framework.GetClusterByNameInput{
 			Name: cluster.Name, Namespace: cluster.Namespace, Getter: c})
 
-		if conditions.GetReason(cluster, clusterv1.ClusterTopologyReconciledCondition) != clusterv1.ClusterTopologyReconciledHookBlockingReason {
-			return false
-		}
-		if !strings.Contains(conditions.GetMessage(cluster, clusterv1.ClusterTopologyReconciledCondition), expectedBlockingMessage) {
-			return false
-		}
-
-		return true
+		return strings.Contains(conditions.GetMessage(cluster, clusterv1.ClusterTopologyReconciledCondition), expectedBlockingMessage)
 	}
 
 	Byf("Waiting for %s hook (via annotation %s) to start blocking", hook, annotation)
@@ -1227,8 +1249,7 @@ func computeHookName(hook string, attributes []string) string {
 
 // clusterConditionShowsHookBlocking checks if the TopologyReconciled condition message contains both the hook name and hookFailedMessage.
 func clusterConditionShowsHookBlocking(cluster *clusterv1.Cluster, hookName string) bool {
-	return conditions.GetReason(cluster, clusterv1.ClusterTopologyReconciledCondition) == clusterv1.ClusterTopologyReconciledHookBlockingReason &&
-		strings.Contains(conditions.GetMessage(cluster, clusterv1.ClusterTopologyReconciledCondition), hookName)
+	return strings.Contains(conditions.GetMessage(cluster, clusterv1.ClusterTopologyReconciledCondition), hookName)
 }
 
 func waitControlPlaneVersion(ctx context.Context, c client.Client, cluster *clusterv1.Cluster, version string, intervals []interface{}) {

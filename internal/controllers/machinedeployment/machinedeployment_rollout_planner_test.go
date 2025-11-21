@@ -282,6 +282,9 @@ func TestComputeDesiredMS(t *testing.T) {
 						NodeVolumeDetachTimeoutSeconds: duration10s,
 						NodeDeletionTimeoutSeconds:     duration10s,
 					},
+					Taints: []clusterv1.MachineTaint{
+						{Key: "taint-key", Value: "taint-value", Effect: corev1.TaintEffectNoSchedule, Propagation: clusterv1.MachineTaintPropagationAlways},
+					},
 				},
 			},
 		},
@@ -375,6 +378,7 @@ func TestComputeDesiredMS(t *testing.T) {
 							NodeVolumeDetachTimeoutSeconds: nil,
 							NodeDeletionTimeoutSeconds:     nil,
 						},
+						Taints: nil,
 					},
 				},
 			},
@@ -398,6 +402,7 @@ func TestComputeDesiredMS(t *testing.T) {
 		expectedMS.Spec.Template.Spec.Deletion.NodeDrainTimeoutSeconds = deployment.Spec.Template.Spec.Deletion.NodeDrainTimeoutSeconds
 		expectedMS.Spec.Template.Spec.Deletion.NodeDeletionTimeoutSeconds = deployment.Spec.Template.Spec.Deletion.NodeDeletionTimeoutSeconds
 		expectedMS.Spec.Template.Spec.Deletion.NodeVolumeDetachTimeoutSeconds = deployment.Spec.Template.Spec.Deletion.NodeVolumeDetachTimeoutSeconds
+		expectedMS.Spec.Template.Spec.Taints = deployment.Spec.Template.Spec.Taints
 
 		g := NewWithT(t)
 		actualMS, err := computeDesiredMS(ctx, deployment, currentMS)
@@ -520,7 +525,7 @@ func machineSetControllerMutator(log *fileLogger, ms *clusterv1.MachineSet, scop
 		}
 	}
 	if replicasEndingInPlaceUpdate.Len() > 0 {
-		log.Logf("[MS controller] - Replicas %s completed in place update", sortAndJoin(replicasEndingInPlaceUpdate.UnsortedList()))
+		log.Logf("[MS controller] - Replicas %s completed in-place update", sortAndJoin(replicasEndingInPlaceUpdate.UnsortedList()))
 	}
 
 	// Starting from here, the code must mirror the implementation of the Reconcile func in the MachineSet controller to ensure the reliability of the tests.
@@ -563,7 +568,7 @@ func machineSetControllerMutatorTriggerInPlaceUpdate(ms *clusterv1.MachineSet, s
 			} else {
 				// If this MachineSet is not accepting anymore machines from other MS (e.g. because of MD spec changes),
 				// then drop the PendingAcknowledgeMove annotation; this machine will be treated as any other machine and either
-				// deleted or moved to another MS after completing the in-place upgrade.
+				// deleted or moved to another MS after completing the in-place update.
 				delete(m.Annotations, clusterv1.PendingAcknowledgeMoveAnnotation)
 			}
 		}
@@ -653,7 +658,7 @@ func machineSetControllerMutatorCreateMachines(log *fileLogger, ms *clusterv1.Ma
 	}
 
 	// Sort machines of the target MS to ensure consistent reporting during tests.
-	sortMachineSetMachinesByName(scope.machineSetMachines[ms.Name])
+	sortMachinesByName(scope.machineSetMachines[ms.Name])
 
 	log.Logf("[MS controller] - %s scale up to %d/%[2]d replicas (%s created)", ms.Name, ptr.Deref(ms.Spec.Replicas, 0), strings.Join(machinesAdded, ","))
 }
@@ -684,7 +689,7 @@ func machineSetControllerMutatorMoveMachines(log *fileLogger, ms *clusterv1.Mach
 	}
 
 	// Sort machines to ensure stable results of the move operation during tests.
-	sortMachineSetMachinesByName(scope.machineSetMachines[ms.Name])
+	sortMachinesByName(scope.machineSetMachines[ms.Name])
 
 	// Always move all the machine that can be moved.
 	// In case the target machine set will end up with more machines than its target replica number, it will take care of this.
@@ -730,8 +735,8 @@ func machineSetControllerMutatorMoveMachines(log *fileLogger, ms *clusterv1.Mach
 
 	// Sort machines of the target MS to ensure consistent reporting during tests.
 	// Note: It is also required to sort machines for the targetMS because both ms and targetMS lists of machines are changed in this func.
-	sortMachineSetMachinesByName(scope.machineSetMachines[ms.Name])
-	sortMachineSetMachinesByName(scope.machineSetMachines[targetMS.Name])
+	sortMachinesByName(scope.machineSetMachines[ms.Name])
+	sortMachinesByName(scope.machineSetMachines[targetMS.Name])
 	return nil
 }
 
@@ -764,7 +769,7 @@ func machineSetControllerMutatorDeleteMachines(log *fileLogger, ms *clusterv1.Ma
 	scope.machineSetMachines[ms.Name] = newMachinesSetMachines
 
 	// Sort machines to ensure consistent reporting during tests.
-	sortMachineSetMachinesByName(scope.machineSetMachines[ms.Name])
+	sortMachinesByName(scope.machineSetMachines[ms.Name])
 
 	log.Logf("[MS controller] - %s scale down to %d/%[2]d replicas (%s deleted)", ms.Name, ptr.Deref(ms.Spec.Replicas, 0), strings.Join(machinesDeleted, ","))
 }
@@ -772,18 +777,23 @@ func machineSetControllerMutatorDeleteMachines(log *fileLogger, ms *clusterv1.Ma
 func machineSetControllerMutatorUpdateStatus(ms *clusterv1.MachineSet, scope *rolloutScope) {
 	// This is a simplified version of the code in the updateStatus func from the MachineSet controller.
 	// Note: the corresponding logic in the MS controller looks at the MachineAvailable condition to
-	// determine availability. Here we are looking at the UpdateInProgress annotation, which is a
+	// determine availability. Here we are looking at the UpdateInProgress, which is a
 	// one of the info considered by the MachineAvailable condition.
 
 	ms.Status.Replicas = ptr.To(int32(len(scope.machineSetMachines[ms.Name])))
 	availableReplicas := int32(0)
+	upToDateReplicas := int32(0)
 	for _, m := range scope.machineSetMachines[ms.Name] {
-		if _, ok := m.Annotations[clusterv1.UpdateInProgressAnnotation]; ok {
+		if inplace.IsUpdateInProgress(m) {
 			continue
+		}
+		if upToDate, _ := mdutil.MachineTemplateUpToDate(&ms.Spec.Template, &scope.machineDeployment.Spec.Template); upToDate {
+			upToDateReplicas++
 		}
 		availableReplicas++
 	}
 	ms.Status.AvailableReplicas = ptr.To(availableReplicas)
+	ms.Status.UpToDateReplicas = ptr.To(upToDateReplicas)
 }
 
 type rolloutScope struct {
@@ -913,25 +923,58 @@ func (r *rolloutScope) Clone() *rolloutScope {
 	return c
 }
 
-func (r rolloutScope) String() string {
-	sb := strings.Builder{}
-	sb.WriteString(fmt.Sprintf("%s, %d/%d replicas\n", r.machineDeployment.Name, ptr.Deref(r.machineDeployment.Status.Replicas, 0), ptr.Deref(r.machineDeployment.Spec.Replicas, 0)))
-
-	sort.Slice(r.machineSets, func(i, j int) bool { return r.machineSets[i].Name < r.machineSets[j].Name })
+func (r rolloutScope) machines() []*clusterv1.Machine {
+	machines := []*clusterv1.Machine{}
 	for _, ms := range r.machineSets {
-		sb.WriteString(fmt.Sprintf("- %s, %s\n", ms.Name, msLog(ms, r.machineSetMachines[ms.Name])))
+		machines = append(machines, r.machineSetMachines[ms.Name]...)
+	}
+	return machines
+}
+
+// summary provides an overview of MachineDeployment, MachineSets and Machines in the scope.
+func (r rolloutScope) summary() string {
+	sb := strings.Builder{}
+	sb.WriteString(fmt.Sprintf("  %s\n", r.machineDeploymentSummary()))
+
+	// sort machineSets to ensure consistent output.
+	sortMachineSetsByName(r.machineSets)
+	for _, ms := range r.machineSets {
+		sb.WriteString(fmt.Sprintf("  %s\n", r.machineSetSummary(ms)))
 	}
 	return sb.String()
 }
 
-func msLog(ms *clusterv1.MachineSet, machines []*clusterv1.Machine) string {
-	sb := strings.Builder{}
+// machineDeploymentSummary provides an overview of MachineDeployment in the scope.
+func (r rolloutScope) machineDeploymentSummary() string {
+	return fmt.Sprintf("%s: %d/%d replicas, %d available, %d upToDate",
+		r.machineDeployment.Name,
+		ptr.Deref(r.machineDeployment.Status.Replicas, 0),
+		ptr.Deref(r.machineDeployment.Spec.Replicas, 0),
+		ptr.Deref(r.machineDeployment.Status.AvailableReplicas, 0),
+		ptr.Deref(r.machineDeployment.Status.UpToDateReplicas, 0),
+	)
+}
+
+// machineSetSummary provides an overview of a MachineSets in the scope.
+func (r rolloutScope) machineSetSummary(ms *clusterv1.MachineSet) string {
+	return fmt.Sprintf("%s: %d/%d replicas, %d available, %d upToDate (%s)",
+		ms.Name,
+		ptr.Deref(ms.Status.Replicas, 0),
+		ptr.Deref(ms.Spec.Replicas, 0),
+		ptr.Deref(ms.Status.AvailableReplicas, 0),
+		ptr.Deref(ms.Status.UpToDateReplicas, 0),
+		r.machinesSummary(ms),
+	)
+}
+
+// machinesSummary provides an overview of Machines controller by a MachineSet in the scope.
+func (r rolloutScope) machinesSummary(ms *clusterv1.MachineSet) string {
 	machineNames := []string{}
 	acknowledgedMoveMachines := sets.Set[string]{}
 	if replicaNames, ok := ms.Annotations[clusterv1.AcknowledgedMoveAnnotation]; ok && replicaNames != "" {
 		acknowledgedMoveMachines.Insert(strings.Split(replicaNames, ",")...)
 	}
-	for _, m := range machines {
+	for _, m := range r.machineSetMachines[ms.Name] {
 		name := m.Name
 		if _, ok := m.Annotations[clusterv1.PendingAcknowledgeMoveAnnotation]; ok && !acknowledgedMoveMachines.Has(name) {
 			name += "🟠"
@@ -941,23 +984,46 @@ func msLog(ms *clusterv1.MachineSet, machines []*clusterv1.Machine) string {
 		}
 		machineNames = append(machineNames, name)
 	}
-	sb.WriteString(strings.Join(machineNames, ","))
-	if moveTo, ok := ms.Annotations[clusterv1.MachineSetMoveMachinesToMachineSetAnnotation]; ok {
-		sb.WriteString(fmt.Sprintf(" => %s", moveTo))
-	}
-	if moveFrom, ok := ms.Annotations[clusterv1.MachineSetReceiveMachinesFromMachineSetsAnnotation]; ok {
-		sb.WriteString(fmt.Sprintf(" <= %s", moveFrom))
-	}
-	msLog := fmt.Sprintf("%d/%d replicas (%s)", ptr.Deref(ms.Status.Replicas, 0), ptr.Deref(ms.Spec.Replicas, 0), sb.String())
-	return msLog
+	return strings.Join(machineNames, ",")
 }
 
-func (r rolloutScope) machines() []*clusterv1.Machine {
-	machines := []*clusterv1.Machine{}
+// rolloutPlannerResultSummary provides an overview of MachineDeployment, MachineSets and Machines in the scope
+// and the changes applied to the MachineSets by the rollout planner.
+// NOTE: this function return the same info that createOrUpdateMachineSetsAndSyncMachineDeploymentRevision is surfacing into logs.
+func (r rolloutScope) rolloutPlannerResultSummary(p *rolloutPlanner) string {
+	o := fmt.Sprintf("  %s: %s\n", r.machineDeployment.Name, r.machineDeploymentSummary())
+
+	// sort machineSets to ensure consistent output.
+	sortMachineSetsByName(r.machineSets)
 	for _, ms := range r.machineSets {
-		machines = append(machines, r.machineSetMachines[ms.Name]...)
+		d := p.getMachineSetDiff(ms)
+
+		o += fmt.Sprintf("  %s: %s (%s)\n", ms.Name, d.Summary, r.machinesSummary(ms))
+		if d.OriginalMS == nil {
+			o += fmt.Sprintf("    - MachineSet %s created, it is now the current MachineSet\n", ms.Name)
+			if d.DesiredReplicas > 0 {
+				o += fmt.Sprintf("    - Scaled up current MachineSet %s from 0 to %d replicas (+%[2]d)\n", ms.Name, d.DesiredReplicas)
+				o += fmt.Sprintf("      - Reason: %s\n", d.Reason)
+			}
+			continue
+		}
+
+		if d.DesiredReplicas < d.OriginalReplicas {
+			o += fmt.Sprintf("    - Scaled down %s MachineSet %s from %d to %d replicas (-%d)\n", d.Type, ms.Name, d.OriginalReplicas, d.DesiredReplicas, d.OriginalReplicas-d.DesiredReplicas)
+			o += fmt.Sprintf("      - Reason: %s\n", d.Reason)
+		}
+		if d.DesiredReplicas > d.OriginalReplicas {
+			o += fmt.Sprintf("    - Scaled up %s MachineSet %s from %d to %d replicas (+%d)\n", d.Type, ms.Name, d.OriginalReplicas, d.DesiredReplicas, d.DesiredReplicas-d.OriginalReplicas)
+			o += fmt.Sprintf("      - Reason: %s\n", d.Reason)
+		}
+		if d.DesiredReplicas == d.OriginalReplicas && d.OtherChanges != "" {
+			o += fmt.Sprintf("    - Updated %s MachineSet %s\n", d.Type, ms.Name)
+		}
+		if d.OtherChanges != "" {
+			o += fmt.Sprintf("      - Diff: %s\n", d.OtherChanges)
+		}
 	}
-	return machines
+	return o
 }
 
 func (r *rolloutScope) Equal(s *rolloutScope) bool {
@@ -1113,10 +1179,18 @@ func (l *fileLogger) WriteLogAndCompareWithGoldenFile() (string, string, error) 
 	return current, golden, nil
 }
 
-func sortMachineSetMachinesByName(machines []*clusterv1.Machine) {
+func sortMachinesByName(machines []*clusterv1.Machine) {
 	sort.Slice(machines, func(i, j int) bool {
 		iNameIndex, _ := strconv.Atoi(strings.TrimPrefix(machines[i].Name, "m"))
 		jNameIndex, _ := strconv.Atoi(strings.TrimPrefix(machines[j].Name, "m"))
+		return iNameIndex < jNameIndex
+	})
+}
+
+func sortMachineSetsByName(machineSets []*clusterv1.MachineSet) {
+	sort.Slice(machineSets, func(i, j int) bool {
+		iNameIndex, _ := strconv.Atoi(strings.TrimPrefix(machineSets[i].Name, "ms"))
+		jNameIndex, _ := strconv.Atoi(strings.TrimPrefix(machineSets[j].Name, "ms"))
 		return iNameIndex < jNameIndex
 	})
 }

@@ -20,6 +20,7 @@ import (
 	"maps"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	. "github.com/onsi/gomega"
@@ -42,6 +43,7 @@ import (
 	"sigs.k8s.io/cluster-api/exp/topology/scope"
 	"sigs.k8s.io/cluster-api/feature"
 	fakeruntimeclient "sigs.k8s.io/cluster-api/internal/runtime/client/fake"
+	"sigs.k8s.io/cluster-api/util/cache"
 	"sigs.k8s.io/cluster-api/util/conversion"
 	"sigs.k8s.io/cluster-api/util/test/builder"
 )
@@ -70,17 +72,26 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 
 	utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.RuntimeSDK, true)
 
+	clusterForCacheEntry := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-ns",
+			Name:      "test-cluster",
+		},
+	}
+
 	catalog := runtimecatalog.New()
 	_ = runtimehooksv1.AddToCatalog(catalog)
+	beforeClusterUpgradeGVH, _ := catalog.GroupVersionHook(runtimehooksv1.BeforeClusterUpgrade)
+	beforeControlPlaneUpgradeGVH, _ := catalog.GroupVersionHook(runtimehooksv1.BeforeControlPlaneUpgrade)
+	afterControlPlaneUpgradeGVH, _ := catalog.GroupVersionHook(runtimehooksv1.AfterControlPlaneUpgrade)
+	beforeWorkersUpgradeGVH, _ := catalog.GroupVersionHook(runtimehooksv1.BeforeWorkersUpgrade)
+	afterWorkersUpgradeGVH, _ := catalog.GroupVersionHook(runtimehooksv1.AfterWorkersUpgrade)
 
-	beforeClusterUpgradeGVH, err := catalog.GroupVersionHook(runtimehooksv1.BeforeClusterUpgrade)
-	if err != nil {
-		panic("unable to compute GVH")
-	}
 	blockingBeforeClusterUpgradeResponse := &runtimehooksv1.BeforeClusterUpgradeResponse{
 		CommonRetryResponse: runtimehooksv1.CommonRetryResponse{
 			CommonResponse: runtimehooksv1.CommonResponse{
-				Status: runtimehooksv1.ResponseStatusSuccess,
+				Status:  runtimehooksv1.ResponseStatusSuccess,
+				Message: "processing",
 			},
 			RetryAfterSeconds: int32(10),
 		},
@@ -93,15 +104,11 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 		},
 	}
 
-	beforeControlPlaneUpgradeGVH, err := catalog.GroupVersionHook(runtimehooksv1.BeforeControlPlaneUpgrade)
-	if err != nil {
-		panic("unable to compute GVH")
-	}
-
 	blockingBeforeControlPlaneUpgradeResponse := &runtimehooksv1.BeforeControlPlaneUpgradeResponse{
 		CommonRetryResponse: runtimehooksv1.CommonRetryResponse{
 			CommonResponse: runtimehooksv1.CommonResponse{
-				Status: runtimehooksv1.ResponseStatusSuccess,
+				Status:  runtimehooksv1.ResponseStatusSuccess,
+				Message: "processing",
 			},
 			RetryAfterSeconds: int32(10),
 		},
@@ -114,15 +121,11 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 		},
 	}
 
-	afterControlPlaneUpgradeGVH, err := catalog.GroupVersionHook(runtimehooksv1.AfterControlPlaneUpgrade)
-	if err != nil {
-		panic("unable to compute GVH")
-	}
-
 	blockingAfterControlPlaneUpgradeResponse := &runtimehooksv1.AfterControlPlaneUpgradeResponse{
 		CommonRetryResponse: runtimehooksv1.CommonRetryResponse{
 			CommonResponse: runtimehooksv1.CommonResponse{
-				Status: runtimehooksv1.ResponseStatusSuccess,
+				Status:  runtimehooksv1.ResponseStatusSuccess,
+				Message: "processing",
 			},
 			RetryAfterSeconds: int32(10),
 		},
@@ -135,15 +138,11 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 		},
 	}
 
-	beforeWorkersUpgradeGVH, err := catalog.GroupVersionHook(runtimehooksv1.BeforeWorkersUpgrade)
-	if err != nil {
-		panic("unable to compute GVH")
-	}
-
 	blockingBeforeWorkersUpgradeResponse := &runtimehooksv1.BeforeWorkersUpgradeResponse{
 		CommonRetryResponse: runtimehooksv1.CommonRetryResponse{
 			CommonResponse: runtimehooksv1.CommonResponse{
-				Status: runtimehooksv1.ResponseStatusSuccess,
+				Status:  runtimehooksv1.ResponseStatusSuccess,
+				Message: "processing",
 			},
 			RetryAfterSeconds: int32(10),
 		},
@@ -156,14 +155,11 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 		},
 	}
 
-	afterWorkersUpgradeGVH, err := catalog.GroupVersionHook(runtimehooksv1.AfterWorkersUpgrade)
-	if err != nil {
-		panic("unable to compute GVH")
-	}
 	blockingAfterWorkersUpgradeResponse := &runtimehooksv1.AfterWorkersUpgradeResponse{
 		CommonRetryResponse: runtimehooksv1.CommonRetryResponse{
 			CommonResponse: runtimehooksv1.CommonResponse{
-				Status: runtimehooksv1.ResponseStatusSuccess,
+				Status:  runtimehooksv1.ResponseStatusSuccess,
+				Message: "processing",
 			},
 			RetryAfterSeconds: int32(10),
 		},
@@ -200,6 +196,7 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 		wantIsStartingUpgrade                bool
 		wantIsWaitingForWorkersUpgrade       bool
 		wantPendingHookAnnotation            string
+		wantHookCacheEntry                   *cache.HookEntry
 	}{
 		// Upgrade cluster with CP, MD, MP (upgrade by one minor)
 
@@ -240,6 +237,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			beforeClusterUpgradeResponse: blockingBeforeClusterUpgradeResponse,
 			wantVersion:                  "v1.2.2",
 			wantIsPendingUpgrade:         true,
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.BeforeClusterUpgrade,
+				time.Now().Add(time.Duration(blockingBeforeClusterUpgradeResponse.RetryAfterSeconds)*time.Second), blockingBeforeClusterUpgradeResponse.Message)),
 		},
 		{
 			name:            "when an upgrade starts: call the BeforeControlPlaneUpgrade hook when BeforeClusterUpgrade hook unblocks, blocking answer",
@@ -273,6 +272,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			wantVersion:                       "v1.2.2",
 			wantIsPendingUpgrade:              true,
 			wantPendingHookAnnotation:         "AfterClusterUpgrade", // changed from previous step
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.BeforeControlPlaneUpgrade,
+				time.Now().Add(time.Duration(blockingBeforeControlPlaneUpgradeResponse.RetryAfterSeconds)*time.Second), blockingBeforeControlPlaneUpgradeResponse.Message)),
 		},
 		{
 			name:                  "when an upgrade starts: pick up a new version when BeforeControlPlaneUpgrade hook unblocks (does not call the BeforeClusterUpgrade hook when already done)",
@@ -344,6 +345,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			afterControlPlaneUpgradeResponse: blockingAfterControlPlaneUpgradeResponse,
 			wantVersion:                      "v1.2.3",
 			wantPendingHookAnnotation:        "AfterClusterUpgrade,AfterControlPlaneUpgrade,AfterWorkersUpgrade,BeforeWorkersUpgrade",
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.AfterControlPlaneUpgrade,
+				time.Now().Add(time.Duration(blockingAfterControlPlaneUpgradeResponse.RetryAfterSeconds)*time.Second), blockingAfterControlPlaneUpgradeResponse.Message)),
 		},
 		{
 			name:                  "after control plane is upgraded: call the BeforeWorkersUpgrade hook when AfterControlPlaneUpgrade hook unblocks, blocking answer",
@@ -376,6 +379,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			beforeWorkersUpgradeResponse: blockingBeforeWorkersUpgradeResponse,
 			wantVersion:                  "v1.2.3",
 			wantPendingHookAnnotation:    "AfterClusterUpgrade,AfterWorkersUpgrade,BeforeWorkersUpgrade", // changed from previous step
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.BeforeWorkersUpgrade,
+				time.Now().Add(time.Duration(blockingBeforeWorkersUpgradeResponse.RetryAfterSeconds)*time.Second), blockingBeforeWorkersUpgradeResponse.Message)),
 		},
 		{
 			name:                  "after control plane is upgraded: BeforeWorkersUpgrade hook unblocks (does not call the AfterControlPlaneUpgrade hook when already done)",
@@ -468,6 +473,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			afterWorkersUpgradeResponse: blockingAfterWorkersUpgradeResponse,
 			wantVersion:                 "v1.2.3",
 			wantPendingHookAnnotation:   "AfterClusterUpgrade,AfterWorkersUpgrade",
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.AfterWorkersUpgrade,
+				time.Now().Add(time.Duration(blockingAfterWorkersUpgradeResponse.RetryAfterSeconds)*time.Second), blockingAfterWorkersUpgradeResponse.Message)),
 		},
 		{
 			name:                  "after workers are upgraded: AfterWorkersUpgrade hook unblocks",
@@ -535,6 +542,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			beforeClusterUpgradeResponse: blockingBeforeClusterUpgradeResponse,
 			wantVersion:                  "v1.2.2",
 			wantIsPendingUpgrade:         true,
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.BeforeClusterUpgrade,
+				time.Now().Add(time.Duration(blockingBeforeClusterUpgradeResponse.RetryAfterSeconds)*time.Second), blockingBeforeClusterUpgradeResponse.Message)),
 		},
 		{
 			name:            "when an upgrade to the first minor starts: call the BeforeControlPlaneUpgrade hook when BeforeClusterUpgrade hook unblocks, blocking answer",
@@ -568,6 +577,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			wantVersion:                       "v1.2.2",
 			wantIsPendingUpgrade:              true,
 			wantPendingHookAnnotation:         "AfterClusterUpgrade", // changed from previous step
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.BeforeControlPlaneUpgrade,
+				time.Now().Add(time.Duration(blockingBeforeControlPlaneUpgradeResponse.RetryAfterSeconds)*time.Second), blockingBeforeControlPlaneUpgradeResponse.Message)),
 		},
 		{
 			name:                  "when an upgrade to the first minor starts: pick up a new version when BeforeControlPlaneUpgrade hook unblocks (does not call the BeforeClusterUpgrade hook when already done)",
@@ -640,6 +651,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			wantVersion:                      "v1.3.3",
 			wantIsPendingUpgrade:             true,
 			wantPendingHookAnnotation:        "AfterClusterUpgrade,AfterControlPlaneUpgrade",
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.AfterControlPlaneUpgrade,
+				time.Now().Add(time.Duration(blockingAfterControlPlaneUpgradeResponse.RetryAfterSeconds)*time.Second), blockingAfterControlPlaneUpgradeResponse.Message)),
 		},
 		{
 			name:                  "when an upgrade to the second minor starts: call the BeforeControlPlaneUpgrade after AfterControlPlaneUpgrade hook unblocks, blocking answer",
@@ -673,6 +686,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			wantVersion:                       "v1.3.3",
 			wantIsPendingUpgrade:              true,
 			wantPendingHookAnnotation:         "AfterClusterUpgrade", // changed from previous step
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.BeforeControlPlaneUpgrade,
+				time.Now().Add(time.Duration(blockingBeforeControlPlaneUpgradeResponse.RetryAfterSeconds)*time.Second), blockingBeforeControlPlaneUpgradeResponse.Message)),
 		},
 		{
 			name:                  "when an upgrade to the second minor starts: pick up a new version when BeforeControlPlaneUpgrade hook unblocks (does not call the BeforeClusterUpgrade hook when already done)",
@@ -744,6 +759,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			afterControlPlaneUpgradeResponse: blockingAfterControlPlaneUpgradeResponse,
 			wantVersion:                      "v1.4.4",
 			wantPendingHookAnnotation:        "AfterClusterUpgrade,AfterControlPlaneUpgrade,AfterWorkersUpgrade,BeforeWorkersUpgrade",
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.AfterControlPlaneUpgrade,
+				time.Now().Add(time.Duration(blockingAfterControlPlaneUpgradeResponse.RetryAfterSeconds)*time.Second), blockingAfterControlPlaneUpgradeResponse.Message)),
 		},
 		{
 			name:                  "when starting workers upgrade to the second minor: call the BeforeWorkersUpgrade hook when AfterControlPlaneUpgradeRequest hook unblocks, blocking answer",
@@ -776,6 +793,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			beforeWorkersUpgradeResponse: blockingBeforeWorkersUpgradeResponse,
 			wantVersion:                  "v1.4.4",
 			wantPendingHookAnnotation:    "AfterClusterUpgrade,AfterWorkersUpgrade,BeforeWorkersUpgrade", // changed from previous step
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.BeforeWorkersUpgrade,
+				time.Now().Add(time.Duration(blockingBeforeWorkersUpgradeResponse.RetryAfterSeconds)*time.Second), blockingBeforeWorkersUpgradeResponse.Message)),
 		},
 		{
 			name:                  "when starting workers upgrade to the second minor: BeforeWorkersUpgrade hook unblocks (does not call the AfterControlPlaneUpgrade hook when already done)",
@@ -848,6 +867,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			afterWorkersUpgradeResponse: blockingAfterWorkersUpgradeResponse,
 			wantVersion:                 "v1.4.4",
 			wantPendingHookAnnotation:   "AfterClusterUpgrade,AfterWorkersUpgrade",
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.AfterWorkersUpgrade,
+				time.Now().Add(time.Duration(blockingAfterWorkersUpgradeResponse.RetryAfterSeconds)*time.Second), blockingAfterWorkersUpgradeResponse.Message)),
 		},
 		{
 			name:                  "after workers are upgraded to the second minor: AfterWorkersUpgrade hook unblocks",
@@ -914,6 +935,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			beforeClusterUpgradeResponse: blockingBeforeClusterUpgradeResponse,
 			wantVersion:                  "v1.2.2",
 			wantIsPendingUpgrade:         true,
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.BeforeClusterUpgrade,
+				time.Now().Add(time.Duration(blockingBeforeClusterUpgradeResponse.RetryAfterSeconds)*time.Second), blockingBeforeClusterUpgradeResponse.Message)),
 		},
 		{
 			name:            "when an upgrade to the first minor starts: call the BeforeControlPlaneUpgrade hook when BeforeClusterUpgrade hook unblocks, blocking answer",
@@ -946,6 +969,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			wantVersion:                       "v1.2.2",
 			wantIsPendingUpgrade:              true,
 			wantPendingHookAnnotation:         "AfterClusterUpgrade", // changed from previous step
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.BeforeControlPlaneUpgrade,
+				time.Now().Add(time.Duration(blockingBeforeControlPlaneUpgradeResponse.RetryAfterSeconds)*time.Second), blockingBeforeControlPlaneUpgradeResponse.Message)),
 		},
 		{
 			name:                  "when an upgrade to the first minor starts: pick up a new version when BeforeControlPlaneUpgrade hook unblocks (does not call the BeforeClusterUpgrade hook when already done)",
@@ -1016,6 +1041,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			wantVersion:                      "v1.3.3",
 			wantIsPendingUpgrade:             true,
 			wantPendingHookAnnotation:        "AfterClusterUpgrade,AfterControlPlaneUpgrade",
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.AfterControlPlaneUpgrade,
+				time.Now().Add(time.Duration(blockingAfterControlPlaneUpgradeResponse.RetryAfterSeconds)*time.Second), blockingAfterControlPlaneUpgradeResponse.Message)),
 		},
 		{
 			name:                  "when an upgrade to the second minor starts: call the BeforeControlPlaneUpgrade after AfterControlPlaneUpgrade hook unblocks, blocking answer",
@@ -1048,6 +1075,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			wantVersion:                       "v1.3.3",
 			wantIsPendingUpgrade:              true,
 			wantPendingHookAnnotation:         "AfterClusterUpgrade", // changed from previous step
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.BeforeControlPlaneUpgrade,
+				time.Now().Add(time.Duration(blockingBeforeControlPlaneUpgradeResponse.RetryAfterSeconds)*time.Second), blockingBeforeControlPlaneUpgradeResponse.Message)),
 		},
 		{
 			name:                  "when an upgrade to the second minor starts: pick up a new version when BeforeControlPlaneUpgrade hook unblocks (does not call the BeforeClusterUpgrade hook when already done)",
@@ -1116,6 +1145,8 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			afterControlPlaneUpgradeResponse: blockingAfterControlPlaneUpgradeResponse,
 			wantVersion:                      "v1.4.4",
 			wantPendingHookAnnotation:        "AfterClusterUpgrade,AfterControlPlaneUpgrade",
+			wantHookCacheEntry: ptr.To(cache.NewHookEntry(clusterForCacheEntry, runtimehooksv1.AfterControlPlaneUpgrade,
+				time.Now().Add(time.Duration(blockingAfterControlPlaneUpgradeResponse.RetryAfterSeconds)*time.Second), blockingAfterControlPlaneUpgradeResponse.Message)),
 		},
 		{
 			name:                  "after control plane is upgraded to the second minor: call the AfterControlPlaneUpgrade hook, non blocking answer",
@@ -1242,6 +1273,13 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 
 			runtimeClient := fakeruntimeclient.NewRuntimeClientBuilder().
 				WithCatalog(catalog).
+				WithGetAllExtensionResponses(map[runtimecatalog.GroupVersionHook][]string{
+					beforeClusterUpgradeGVH:      {"foo"},
+					beforeControlPlaneUpgradeGVH: {"foo"},
+					afterControlPlaneUpgradeGVH:  {"foo"},
+					beforeWorkersUpgradeGVH:      {"foo"},
+					afterWorkersUpgradeGVH:       {"foo"},
+				}).
 				WithCallAllExtensionResponses(map[runtimecatalog.GroupVersionHook]runtimehooksv1.ResponseObject{
 					beforeClusterUpgradeGVH:      tt.beforeClusterUpgradeResponse,
 					beforeControlPlaneUpgradeGVH: tt.beforeControlPlaneUpgradeResponse,
@@ -1257,6 +1295,7 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 			r := &generator{
 				Client:        fakeClient,
 				RuntimeClient: runtimeClient,
+				hookCache:     cache.New[cache.HookEntry](cache.HookCacheDefaultTTL),
 			}
 			version, err := r.computeControlPlaneVersion(ctx, s)
 			g.Expect(err).ToNot(HaveOccurred())
@@ -1278,6 +1317,25 @@ func TestComputeControlPlaneVersion_LifecycleHooksSequences(t *testing.T) {
 				g.Expect(s.Current.Cluster.Annotations).To(HaveKeyWithValue(runtimev1.PendingHooksAnnotation, tt.wantPendingHookAnnotation), "Unexpected PendingHookAnnotation")
 			} else {
 				g.Expect(s.Current.Cluster.Annotations).ToNot(HaveKey(runtimev1.PendingHooksAnnotation), "Unexpected PendingHookAnnotation")
+			}
+
+			if tt.wantHookCacheEntry != nil {
+				// Verify the cache entry.
+				cacheEntry, ok := r.hookCache.Has(tt.wantHookCacheEntry.Key())
+				g.Expect(ok).To(BeTrue())
+				g.Expect(cacheEntry.ObjectKey).To(Equal(tt.wantHookCacheEntry.ObjectKey))
+				g.Expect(cacheEntry.HookName).To(Equal(tt.wantHookCacheEntry.HookName))
+				g.Expect(cacheEntry.ReconcileAfter).To(BeTemporally("~", tt.wantHookCacheEntry.ReconcileAfter, 5*time.Second))
+				g.Expect(cacheEntry.ResponseMessage).To(Equal(tt.wantHookCacheEntry.ResponseMessage))
+
+				// Call computeControlPlaneVersion again and verify the cache hit.
+				hooksCalled = sets.Set[string]{}
+				version, err := r.computeControlPlaneVersion(ctx, s)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(version).To(Equal(tt.wantVersion))
+				g.Expect(hooksCalled).To(BeEmpty())
+			} else {
+				g.Expect(r.hookCache.Len()).To(Equal(0))
 			}
 		})
 	}

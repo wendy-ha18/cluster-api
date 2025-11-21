@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -53,7 +54,7 @@ func (r *KubeadmControlPlaneReconciler) initializeControlPlane(ctx context.Conte
 	}
 
 	log.WithValues(controlPlane.StatusToLogKeyAndValues(newMachine, nil)...).
-		Info("Machine created (init)",
+		Info(fmt.Sprintf("Machine %s created (init)", newMachine.Name),
 			"Machine", klog.KObj(newMachine),
 			newMachine.Spec.InfrastructureRef.Kind, klog.KRef(newMachine.Namespace, newMachine.Spec.InfrastructureRef.Name),
 			newMachine.Spec.Bootstrap.ConfigRef.Kind, klog.KRef(newMachine.Namespace, newMachine.Spec.Bootstrap.ConfigRef.Name))
@@ -87,7 +88,7 @@ func (r *KubeadmControlPlaneReconciler) scaleUpControlPlane(ctx context.Context,
 	}
 
 	log.WithValues(controlPlane.StatusToLogKeyAndValues(newMachine, nil)...).
-		Info("Machine created (scale up)",
+		Info(fmt.Sprintf("Machine %s created (scale up)", newMachine.Name),
 			"Machine", klog.KObj(newMachine),
 			newMachine.Spec.InfrastructureRef.Kind, klog.KRef(newMachine.Namespace, newMachine.Spec.InfrastructureRef.Name),
 			newMachine.Spec.Bootstrap.ConfigRef.Kind, klog.KRef(newMachine.Namespace, newMachine.Spec.Bootstrap.ConfigRef.Name))
@@ -144,7 +145,7 @@ func (r *KubeadmControlPlaneReconciler) scaleDownControlPlane(
 	// Note: We intentionally log after Delete because we want this log line to show up only after DeletionTimestamp has been set.
 	// Also, setting DeletionTimestamp doesn't mean the Machine is actually deleted (deletion takes some time).
 	log.WithValues(controlPlane.StatusToLogKeyAndValues(nil, machineToDelete)...).
-		Info("Deleting Machine (scale down)", "Machine", klog.KObj(machineToDelete))
+		Info(fmt.Sprintf("Machine %s deleting (scale down)", machineToDelete.Name), "Machine", klog.KObj(machineToDelete))
 
 	// Requeue the control plane, in case there are additional operations to perform
 	return ctrl.Result{Requeue: true}, nil
@@ -190,6 +191,9 @@ func (r *KubeadmControlPlaneReconciler) preflightChecks(ctx context.Context, con
 			}
 			log.Info(fmt.Sprintf("Waiting for a version upgrade to %s to be propagated", v))
 			controlPlane.PreflightCheckResults.TopologyVersionMismatch = true
+			// Slow down reconcile frequency, as deferring a version upgrade waits for slow processes,
+			// e.g. workers are completing a previous upgrade step.
+			r.controller.DeferNextReconcileForObject(controlPlane.KCP, time.Now().Add(5*time.Second))
 			return ctrl.Result{RequeueAfter: preflightFailedRequeueAfter}
 		}
 	}
@@ -198,6 +202,8 @@ func (r *KubeadmControlPlaneReconciler) preflightChecks(ctx context.Context, con
 	if controlPlane.HasDeletingMachine() {
 		controlPlane.PreflightCheckResults.HasDeletingMachine = true
 		log.Info("Waiting for machines to be deleted", "machines", strings.Join(controlPlane.Machines.Filter(collections.HasDeletionTimestamp).Names(), ", "))
+		// Slow down reconcile frequency, deletion is a slow process.
+		r.controller.DeferNextReconcileForObject(controlPlane.KCP, time.Now().Add(5*time.Second))
 		return ctrl.Result{RequeueAfter: deleteRequeueAfter}
 	}
 
@@ -254,7 +260,10 @@ loopmachines:
 		r.recorder.Eventf(controlPlane.KCP, corev1.EventTypeWarning, "ControlPlaneUnhealthy",
 			"Waiting for control plane to pass preflight checks to continue reconciliation: %v", aggregatedError)
 		log.Info("Waiting for control plane to pass preflight checks", "failures", aggregatedError.Error())
-
+		// Slow down reconcile frequency, it takes some time before control plane components stabilize
+		// after a new Machine is created. Similarly, if there are issues on running Machines, it
+		// usually takes some time to get back to normal state.
+		r.controller.DeferNextReconcileForObject(controlPlane.KCP, time.Now().Add(5*time.Second))
 		return ctrl.Result{RequeueAfter: preflightFailedRequeueAfter}
 	}
 

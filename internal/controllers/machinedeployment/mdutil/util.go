@@ -412,22 +412,35 @@ func MachineTemplateUpToDate(current, desired *clusterv1.MachineTemplateSpec) (b
 // MachineTemplateDeepCopyRolloutFields copies a MachineTemplateSpec
 // and sets all fields that should be propagated in-place to nil and drops version from
 // external references.
+// Note: Please update inplace.CleanupMachineSpecForDiff accordingly if necessary.
 func MachineTemplateDeepCopyRolloutFields(template *clusterv1.MachineTemplateSpec) *clusterv1.MachineTemplateSpec {
 	templateCopy := template.DeepCopy()
+	spec := templateCopy.Spec
 
-	// Moving MD from one cluster to another is not supported.
-	templateCopy.Spec.ClusterName = ""
+	// The following fields are set to their zero value so they are omitted from the comparison,
+	// because they should never be the reason for a rollout.
 
 	// Drop labels and annotations
 	templateCopy.Labels = nil
 	templateCopy.Annotations = nil
 
-	// Drop node timeout values
-	templateCopy.Spec.MinReadySeconds = nil
-	templateCopy.Spec.ReadinessGates = nil
-	templateCopy.Spec.Deletion.NodeDrainTimeoutSeconds = nil
-	templateCopy.Spec.Deletion.NodeDeletionTimeoutSeconds = nil
-	templateCopy.Spec.Deletion.NodeVolumeDetachTimeoutSeconds = nil
+	// Should never change.
+	spec.ClusterName = ""
+
+	// Bootstrap and InfrastructureRef should be compared.
+
+	// Should not be set.
+	spec.ProviderID = ""
+
+	// Version & FailureDomain should be compared.
+
+	// Fields that are mutated in-place without a rollout.
+	spec.MinReadySeconds = nil
+	spec.ReadinessGates = nil
+	spec.Deletion.NodeDrainTimeoutSeconds = nil
+	spec.Deletion.NodeVolumeDetachTimeoutSeconds = nil
+	spec.Deletion.NodeDeletionTimeoutSeconds = nil
+	spec.Taints = nil
 
 	return templateCopy
 }
@@ -470,7 +483,7 @@ func FindNewAndOldMachineSets(deployment *clusterv1.MachineDeployment, msList []
 				// No need to set an additional condition message, it is not used anywhere.
 				upToDateResults[ms.Name] = upToDateResult
 			}
-			diffs = append(diffs, fmt.Sprintf("MachineSet %s: diff: %s", ms.Name, strings.Join(upToDateResult.LogMessages, ", ")))
+			diffs = append(diffs, fmt.Sprintf("MachineSet %s needs rollout: %s", ms.Name, strings.Join(upToDateResult.LogMessages, ", ")))
 		}
 	}
 
@@ -649,39 +662,39 @@ func DeploymentComplete(deployment *clusterv1.MachineDeployment, newStatus *clus
 // 1) The new MS is saturated: newMS's replicas == deployment's replicas
 // 2) For RollingUpdateStrategy: Max number of machines allowed is reached: deployment's replicas + maxSurge == all MSs' replicas.
 // 3) For OnDeleteStrategy: Max number of machines allowed is reached: deployment's replicas == all MSs' replicas.
-func NewMSNewReplicas(deployment *clusterv1.MachineDeployment, allMSs []*clusterv1.MachineSet, newMSReplicas int32) (int32, error) {
+func NewMSNewReplicas(deployment *clusterv1.MachineDeployment, allMSs []*clusterv1.MachineSet, newMSReplicas int32) (int32, string, error) {
 	switch deployment.Spec.Rollout.Strategy.Type {
 	case clusterv1.RollingUpdateMachineDeploymentStrategyType:
 		// Check if we can scale up.
 		maxSurge, err := intstrutil.GetScaledValueFromIntOrPercent(deployment.Spec.Rollout.Strategy.RollingUpdate.MaxSurge, int(*(deployment.Spec.Replicas)), true)
 		if err != nil {
-			return 0, err
+			return 0, "", err
 		}
 		// Find the total number of machines
 		currentMachineCount := TotalMachineSetsReplicaSum(allMSs)
 		maxTotalMachines := *(deployment.Spec.Replicas) + int32(maxSurge)
 		if currentMachineCount >= maxTotalMachines {
 			// Cannot scale up.
-			return newMSReplicas, nil
+			return newMSReplicas, fmt.Sprintf("%d current Machines >= %d MachineDeployment spec.replicas + %d maxSurge", currentMachineCount, ptr.Deref(deployment.Spec.Replicas, 0), maxSurge), nil
 		}
 		// Scale up.
 		scaleUpCount := maxTotalMachines - currentMachineCount
 		// Do not exceed the number of desired replicas.
 		scaleUpCount = min(scaleUpCount, *(deployment.Spec.Replicas)-newMSReplicas)
-		return newMSReplicas + scaleUpCount, nil
+		return newMSReplicas + scaleUpCount, fmt.Sprintf("%d current Machines < %d MachineDeployment spec.replicas + %d maxSurge", currentMachineCount, ptr.Deref(deployment.Spec.Replicas, 0), maxSurge), nil
 	case clusterv1.OnDeleteMachineDeploymentStrategyType:
 		// Find the total number of machines
 		currentMachineCount := TotalMachineSetsReplicaSum(allMSs)
 		if currentMachineCount >= *(deployment.Spec.Replicas) {
 			// Cannot scale up as more replicas exist than desired number of replicas in the MachineDeployment.
-			return newMSReplicas, nil
+			return newMSReplicas, fmt.Sprintf("%d current Machines >= %d MachineDeployment spec.replicas", currentMachineCount, ptr.Deref(deployment.Spec.Replicas, 0)), nil
 		}
 		// Scale up the latest MachineSet so the total amount of replicas across all MachineSets match
 		// the desired number of replicas in the MachineDeployment
 		scaleUpCount := *(deployment.Spec.Replicas) - currentMachineCount
-		return newMSReplicas + scaleUpCount, nil
+		return newMSReplicas + scaleUpCount, fmt.Sprintf("%d current Machines < %d MachineDeployment spec.replicas", currentMachineCount, ptr.Deref(deployment.Spec.Replicas, 0)), nil
 	default:
-		return 0, fmt.Errorf("failed to compute replicas: deployment strategy %v isn't supported", deployment.Spec.Rollout.Strategy.Type)
+		return 0, "", fmt.Errorf("failed to compute replicas: deployment strategy %v isn't supported", deployment.Spec.Rollout.Strategy.Type)
 	}
 }
 

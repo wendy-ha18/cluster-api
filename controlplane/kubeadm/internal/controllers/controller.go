@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -35,7 +36,6 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -48,6 +48,7 @@ import (
 	"sigs.k8s.io/cluster-api/controlplane/kubeadm/internal"
 	runtimeclient "sigs.k8s.io/cluster-api/exp/runtime/client"
 	"sigs.k8s.io/cluster-api/feature"
+	capicontrollerutil "sigs.k8s.io/cluster-api/internal/util/controller"
 	"sigs.k8s.io/cluster-api/internal/util/inplace"
 	"sigs.k8s.io/cluster-api/internal/util/ssa"
 	"sigs.k8s.io/cluster-api/util"
@@ -84,7 +85,7 @@ type KubeadmControlPlaneReconciler struct {
 	APIReader           client.Reader
 	SecretCachingClient client.Client
 	RuntimeClient       runtimeclient.Client
-	controller          controller.Controller
+	controller          capicontrollerutil.Controller
 	recorder            record.EventRecorder
 	ClusterCache        clustercache.ClusterCache
 
@@ -131,23 +132,18 @@ func (r *KubeadmControlPlaneReconciler) SetupWithManager(ctx context.Context, mg
 	}
 
 	predicateLog := ctrl.LoggerFrom(ctx).WithValues("controller", "kubeadmcontrolplane")
-	c, err := ctrl.NewControllerManagedBy(mgr).
+	c, err := capicontrollerutil.NewControllerManagedBy(mgr, predicateLog).
 		For(&controlplanev1.KubeadmControlPlane{}).
-		Owns(&clusterv1.Machine{}, builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog))).
+		Owns(&clusterv1.Machine{}).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue)).
 		Watches(
 			&clusterv1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(r.ClusterToKubeadmControlPlane),
-			builder.WithPredicates(
-				predicates.All(mgr.GetScheme(), predicateLog,
-					predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog),
-					predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue),
-					predicates.Any(mgr.GetScheme(), predicateLog,
-						predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(mgr.GetScheme(), predicateLog),
-						predicates.ClusterTopologyVersionChanged(mgr.GetScheme(), predicateLog),
-					),
-				),
+			predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue),
+			predicates.Any(mgr.GetScheme(), predicateLog,
+				predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(mgr.GetScheme(), predicateLog),
+				predicates.ClusterTopologyVersionChanged(mgr.GetScheme(), predicateLog),
 			),
 		).
 		WatchesRawSource(r.ClusterCache.GetClusterSource("kubeadmcontrolplane", r.ClusterToKubeadmControlPlane,
@@ -281,12 +277,6 @@ func (r *KubeadmControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 			if conditions.IsFalse(kcp, controlplanev1.KubeadmControlPlaneControlPlaneComponentsHealthyCondition) {
 				res = ctrl.Result{RequeueAfter: 20 * time.Second}
 			}
-		}
-
-		// Note: controller-runtime logs a warning that non-empty result is ignored
-		// if error is not nil, so setting result here to empty to avoid noisy warnings.
-		if reterr != nil {
-			res = ctrl.Result{}
 		}
 	}()
 
@@ -456,6 +446,11 @@ func (r *KubeadmControlPlaneReconciler) reconcile(ctx context.Context, controlPl
 	}
 
 	if err := r.syncMachines(ctx, controlPlane); err != nil {
+		// Note: If any of the calls got a NotFound error, it means that at least one Machine got deleted.
+		// Let's return here so that the next Reconcile will get the updated list of Machines.
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil // Note: Requeue is not needed, changes to Machines trigger another reconcile.
+		}
 		return ctrl.Result{}, errors.Wrap(err, "failed to sync Machines")
 	}
 
@@ -504,7 +499,9 @@ func (r *KubeadmControlPlaneReconciler) reconcile(ctx context.Context, controlPl
 	// Note: We have to wait here even if there are no more Machines that need rollout (in-place update in
 	// progress is not counted as needs rollout).
 	if machines := controlPlane.MachinesToCompleteInPlaceUpdate(); machines.Len() > 0 {
-		log.Info("Waiting for in-place update to complete", "machines", strings.Join(machines.Names(), ", "))
+		for _, machine := range machines {
+			log.Info(fmt.Sprintf("Waiting for in-place update of Machine %s to complete", machine.Name), "Machine", klog.KObj(machine))
+		}
 		return ctrl.Result{}, nil // Note: Changes to Machines trigger another reconcile.
 	}
 
@@ -513,10 +510,12 @@ func (r *KubeadmControlPlaneReconciler) reconcile(ctx context.Context, controlPl
 	switch {
 	case len(machinesNeedingRollout) > 0:
 		var allMessages []string
-		for machine, machineUpToDateResult := range machinesUpToDateResults {
-			allMessages = append(allMessages, fmt.Sprintf("Machine %s needs rollout: %s", machine, strings.Join(machineUpToDateResult.LogMessages, ",")))
+		machinesNeedingRolloutNames := machinesNeedingRollout.Names()
+		slices.Sort(machinesNeedingRolloutNames)
+		for _, name := range machinesNeedingRolloutNames {
+			allMessages = append(allMessages, fmt.Sprintf("Machine %s needs rollout: %s", name, strings.Join(machinesUpToDateResults[name].LogMessages, ", ")))
 		}
-		log.Info(fmt.Sprintf("Rolling out Control Plane machines: %s", strings.Join(allMessages, ",")), "machinesNeedingRollout", machinesNeedingRollout.Names())
+		log.Info(fmt.Sprintf("Machines need rollout: %s", strings.Join(machinesNeedingRolloutNames, ",")), "reason", strings.Join(allMessages, ", "))
 		v1beta1conditions.MarkFalse(controlPlane.KCP, controlplanev1.MachinesSpecUpToDateV1Beta1Condition, controlplanev1.RollingUpdateInProgressV1Beta1Reason, clusterv1.ConditionSeverityWarning, "Rolling %d replicas with outdated spec (%d replicas up to date)", len(machinesNeedingRollout), len(controlPlane.Machines)-len(machinesNeedingRollout))
 		return r.updateControlPlane(ctx, controlPlane, machinesNeedingRollout, machinesUpToDateResults)
 	default:
@@ -1042,10 +1041,15 @@ func reconcileMachineUpToDateCondition(_ context.Context, controlPlane *internal
 		}
 
 		if inplace.IsUpdateInProgress(machine) {
+			msg := "* In-place update in progress"
+			if c := conditions.Get(machine, clusterv1.MachineUpdatingCondition); c != nil && c.Status == metav1.ConditionTrue && c.Message != "" {
+				msg = fmt.Sprintf("* %s", c.Message)
+			}
 			conditions.Set(machine, metav1.Condition{
-				Type:   clusterv1.MachineUpToDateCondition,
-				Status: metav1.ConditionFalse,
-				Reason: clusterv1.MachineUpToDateUpdatingReason,
+				Type:    clusterv1.MachineUpToDateCondition,
+				Status:  metav1.ConditionFalse,
+				Reason:  clusterv1.MachineUpToDateUpdatingReason,
+				Message: msg,
 			})
 			continue
 		}

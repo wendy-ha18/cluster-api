@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -31,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2"
-	"k8s.io/klog/v2/textlogger"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -51,6 +49,7 @@ func TestReconcileReplicasPendingAcknowledgeMove(t *testing.T) {
 		machines                          []*clusterv1.Machine
 		expectedReplicas                  int32
 		expectedAcknowledgeMoveAnnotation *string
+		expectedNotes                     []string
 	}{
 		{
 			name:                              "Should not scale up when there are no machines",
@@ -81,6 +80,7 @@ func TestReconcileReplicasPendingAcknowledgeMove(t *testing.T) {
 			},
 			expectedReplicas:                  2, // up by one
 			expectedAcknowledgeMoveAnnotation: ptr.To("m2"),
+			expectedNotes:                     []string{"acknowledge Machines m2 moved from an old MachineSet"},
 		},
 		{
 			name:          "Should scale up when there are machines recently moved to newMS and not yet acknowledged and there are other machines already acknowledged",
@@ -93,6 +93,7 @@ func TestReconcileReplicasPendingAcknowledgeMove(t *testing.T) {
 			},
 			expectedReplicas:                  2, // up by one
 			expectedAcknowledgeMoveAnnotation: ptr.To("m1,m2"),
+			expectedNotes:                     []string{"acknowledge Machines m1,m2 moved from an old MachineSet"},
 		},
 		{
 			name:          "Should not scale up when there machines with the pendingAcknowledgeMove annotation but they are already acknowledged",
@@ -123,12 +124,12 @@ func TestReconcileReplicasPendingAcknowledgeMove(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			planner := newRolloutPlanner()
+			planner := newRolloutPlanner(nil, nil, nil)
 			planner.md = tc.md
 			planner.newMS = tc.newMS
 			if tc.originalNewMS != nil {
-				planner.originalMS = make(map[string]*clusterv1.MachineSet)
-				planner.originalMS[tc.newMS.Name] = tc.originalNewMS
+				planner.originalMSs = make(map[string]*clusterv1.MachineSet)
+				planner.originalMSs[tc.newMS.Name] = tc.originalNewMS
 			}
 			planner.machines = tc.machines
 
@@ -139,6 +140,7 @@ func TestReconcileReplicasPendingAcknowledgeMove(t *testing.T) {
 			} else {
 				g.Expect(planner.newMS.Annotations).ToNot(HaveKey(clusterv1.AcknowledgedMoveAnnotation))
 			}
+			g.Expect(planner.notes[tc.newMS.Name]).To(Equal(tc.expectedNotes), "unexpected notes")
 		})
 	}
 }
@@ -150,6 +152,7 @@ func TestReconcileNewMachineSet(t *testing.T) {
 		newMachineSet                 *clusterv1.MachineSet
 		oldMachineSets                []*clusterv1.MachineSet
 		expectedNewMachineSetReplicas int
+		expectedNotes                 []string
 		error                         error
 	}{
 		{
@@ -182,6 +185,7 @@ func TestReconcileNewMachineSet(t *testing.T) {
 				},
 			},
 			expectedNewMachineSetReplicas: 2,
+			expectedNotes:                 []string{"0 current Machines < 2 MachineDeployment spec.replicas + 2 maxSurge"},
 		},
 		{
 			name: "RollingUpdate strategy: Scale down: 2 -> 0",
@@ -213,6 +217,7 @@ func TestReconcileNewMachineSet(t *testing.T) {
 				},
 			},
 			expectedNewMachineSetReplicas: 0,
+			expectedNotes:                 []string{"scale down to align MachineSet spec.replicas to MachineDeployment spec.replicas"},
 		},
 		{
 			name: "RollingUpdate strategy: Scale up does not go above maxSurge (3+2)",
@@ -258,7 +263,8 @@ func TestReconcileNewMachineSet(t *testing.T) {
 					},
 				},
 			},
-			error: nil,
+			error:         nil,
+			expectedNotes: []string{"4 current Machines < 3 MachineDeployment spec.replicas + 2 maxSurge"},
 		},
 		{
 			name: "RollingUpdate strategy: Scale up accounts for deleting Machines to honour maxSurge",
@@ -349,7 +355,7 @@ func TestReconcileNewMachineSet(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			planner := newRolloutPlanner()
+			planner := newRolloutPlanner(nil, nil, nil)
 			planner.md = tc.machineDeployment
 			planner.newMS = tc.newMachineSet
 			planner.oldMSs = tc.oldMachineSets
@@ -368,6 +374,7 @@ func TestReconcileNewMachineSet(t *testing.T) {
 				scaleIntent = v
 			}
 			g.Expect(scaleIntent).To(BeEquivalentTo(tc.expectedNewMachineSetReplicas))
+			g.Expect(planner.notes[tc.newMachineSet.Name]).To(Equal(tc.expectedNotes), "unexpected notes")
 		})
 	}
 }
@@ -382,6 +389,7 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 		newMS                      *clusterv1.MachineSet
 		oldMSs                     []*clusterv1.MachineSet
 		expectScaleIntent          map[string]int32
+		expectedNotes              map[string][]string
 		skipMaxUnavailabilityCheck bool
 	}{
 		{
@@ -395,6 +403,7 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 			expectScaleIntent: map[string]int32{
 				// no new scale down intent for oldMSs (ms1):
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name:        "do not scale down if replicas is equal to minAvailable replicas",
@@ -408,6 +417,7 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				// no new scale down intent for oldMSs (ms1):
 				// 2 available replicas from ms1 + 1 available replica from ms2 = 3 available replicas == minAvailability, we cannot scale down
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name:        "do not scale down if replicas is less then minAvailable replicas",
@@ -422,6 +432,7 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				// 1 available replicas from ms1 + 1 available replica from ms2 = 2 available replicas < minAvailability, we cannot scale down
 			},
 			skipMaxUnavailabilityCheck: true,
+			expectedNotes:              map[string][]string{},
 		},
 		{
 			name:        "do not scale down if there are more replicas than minAvailable replicas, but scale down from a previous reconcile already takes the availability buffer",
@@ -435,6 +446,7 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				// no new scale down intent for oldMSs (ms1):
 				// 3 available replicas from ms1 - 1 replica already scaling down from ms1 + 1 available replica from ms2 = 3 available replicas == minAvailability, we cannot further scale down
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name:        "do not scale down if there are more replicas than minAvailable replicas, but scale down from a previous reconcile already takes the availability buffer, scale down from a previous reconcile on another MS",
@@ -449,6 +461,35 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				// no new scale down intent for oldMSs (ms1):
 				// 3 available replicas from ms1 - 1 replica already scaling down from ms1 + 3 available replica from ms2 = 5 available replicas == minAvailability, we cannot further scale down
 			},
+			expectedNotes: map[string][]string{},
+		},
+		{
+			name:        "do not scale down if there are unavailable replicas on the new MachineSet (maxSurge 1, maxUnavailable 0), all  machines unavailable",
+			scaleIntent: map[string]int32{},
+			md:          createMD("v2", 3, withRollingUpdateStrategy(1, 0)),
+			newMS:       createMS("ms2", "v2", 1, withStatusReplicas(1), withStatusAvailableReplicas(0)), // one machine created on the new NewMS due to maxSurge, but it is not reaching the available state,
+			oldMSs: []*clusterv1.MachineSet{
+				createMS("ms1", "v1", 3, withStatusReplicas(3), withStatusAvailableReplicas(0)),
+			},
+			expectScaleIntent: map[string]int32{
+				// no new scale down intent for oldMSs (ms1): unavailability on new MS
+			},
+			expectedNotes:              map[string][]string{},
+			skipMaxUnavailabilityCheck: true, // The test case is simulating all machines not unavailable, so this check will fail
+		},
+		{
+			name:        "do not scale down if there are unavailable replicas on the new MachineSet (maxSurge 0, maxUnavailable 1), all  machines unavailable",
+			scaleIntent: map[string]int32{},
+			md:          createMD("v2", 3, withRollingUpdateStrategy(0, 1)),
+			newMS:       createMS("ms2", "v2", 1, withStatusReplicas(1), withStatusAvailableReplicas(0)), // one machine created on the new NewMS after scale down on the old MS, but it is not reaching the available state,
+			oldMSs: []*clusterv1.MachineSet{
+				createMS("ms1", "v1", 2, withStatusReplicas(2), withStatusAvailableReplicas(0)), // OldMS scaled down due to maxUnavailable 1
+			},
+			expectScaleIntent: map[string]int32{
+				// no new scale down intent for oldMSs (ms1): unavailability on new MS
+			},
+			expectedNotes:              map[string][]string{},
+			skipMaxUnavailabilityCheck: true, // The test case is simulating all machines not unavailable, so this check will fail
 		},
 		{
 			name: "do not scale down if there are more replicas than minAvailable replicas, but scale down from current reconcile already takes the availability buffer (newMS is scaling down)",
@@ -465,6 +506,7 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				// no new scale down intent for oldMSs (ms1):
 				// 2 available replicas from ms1 + 2 available replicas from ms2 - 1 replica already scaling down from ms2 = 3 available replicas == minAvailability, we cannot further scale down
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name: "do not scale down if there are more replicas than minAvailable replicas, but scale down from current reconcile already takes the availability buffer (oldMS is scaling down)",
@@ -481,6 +523,7 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				"ms1": 1,
 				// 2 available replicas from ms1 - 1 replica already scaling down from ms1 + 2 available replicas from ms2 = 3 available replicas == minAvailability, we cannot further scale down
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name:        "do not scale down replicas when there are more replicas than minAvailable replicas, but not all the replicas are available (unavailability on newMS)",
@@ -494,6 +537,7 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				// no new scale down intent for oldMSs (ms1):
 				// 3 available replicas from ms1 + 0 available replicas from ms2 = 3 available replicas == minAvailability, we cannot further scale down
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name:        "do not scale down replicas when there are more replicas than minAvailable replicas, but not all the replicas are available (unavailability on oldMS)",
@@ -507,6 +551,7 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				// no new scale down intent for oldMSs (ms1):
 				// 2 available replicas from ms1 + 1 available replicas from ms2 = 3 available replicas == minAvailability, we cannot further scale down
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name:        "scale down replicas when there are more replicas than minAvailable replicas, all replicas are available",
@@ -519,6 +564,9 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 			expectScaleIntent: map[string]int32{
 				// new scale down intent for oldMSs (ms1):
 				"ms1": 2, // 3 available replicas from ms1 + 1 available replicas from ms2 = 4 available replicas > minAvailability, scale down to 2 replicas (-1)
+			},
+			expectedNotes: map[string][]string{
+				"ms1": {"4 available replicas > 3 minimum available replicas"},
 			},
 		},
 		{
@@ -538,6 +586,10 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				"ms3": 0, // 0 available replicas from ms3, it can be scaled down without impact on availability (-2)
 				// no need to further scale down.
 			},
+			expectedNotes: map[string][]string{
+				"ms2": {"scale down to align to existing Machines or scale down by removing unavailable replicas (and no available replicas exist on the MachineSet)"},
+				"ms3": {"scale down to align to existing Machines or scale down by removing unavailable replicas (and no available replicas exist on the MachineSet)"},
+			},
 		},
 		{
 			name:        "scale down replicas when there are more replicas than minAvailable replicas, unavailable replicas are scaled down first, available replicas are scaled down when unavailable replicas are gone",
@@ -555,6 +607,11 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				"ms2": 0, // 0 available replicas from ms2, it can be scaled down to 0 without any impact on availability (-1)
 				"ms3": 0, // 0 available replicas from ms3, it can be scaled down to 0 without any impact on availability (-2)
 				"ms1": 2, // 3 available replicas from ms1 + 1 available replica from ms4 = 4 available replicas > minAvailability, scale down to 2 replicas (-1)
+			},
+			expectedNotes: map[string][]string{
+				"ms1": {"4 available replicas > 3 minimum available replicas"},
+				"ms2": {"scale down to align to existing Machines or scale down by removing unavailable replicas (and no available replicas exist on the MachineSet)"},
+				"ms3": {"scale down to align to existing Machines or scale down by removing unavailable replicas (and no available replicas exist on the MachineSet)"},
 			},
 		},
 		{
@@ -574,6 +631,11 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				"ms3": 0, // 0 available replicas from ms3, it can be scaled down to 0 without any impact on availability (-5)
 				"ms1": 2, // 3 available replicas from ms1 + 1 available replica from ms4 = 4 available replicas > minAvailability, scale down to 2 replicas, also drop the replica without machine (-2)
 			},
+			expectedNotes: map[string][]string{
+				"ms1": {"scale down to align to existing Machines or scale down by removing unavailable replicas (and no available replicas exist on the MachineSet)", "4 available replicas > 3 minimum available replicas"},
+				"ms2": {"scale down to align to existing Machines or scale down by removing unavailable replicas (and no available replicas exist on the MachineSet)"},
+				"ms3": {"scale down to align to existing Machines or scale down by removing unavailable replicas (and no available replicas exist on the MachineSet)"},
+			},
 		},
 		{
 			name:        "scale down replicas when there are more replicas than minAvailable replicas, unavailable replicas are scaled down first, scale down stops before breaching minAvailable replicas",
@@ -590,6 +652,9 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				"ms2": 0, // 0 available replicas from ms2, it can be scaled down to 0 without any impact on availability (-1)
 				// even if there is still room to scale down, we cannot scale down ms3: 1 available replica from ms1 + 1 available replica from ms4 = 2 available replicas < minAvailability
 				// does not make sense to continue scale down as there is no guarantee that MS3 would remove the unavailable replica
+			},
+			expectedNotes: map[string][]string{
+				"ms2": {"scale down to align to existing Machines or scale down by removing unavailable replicas (and no available replicas exist on the MachineSet)"},
 			},
 		},
 		{
@@ -609,6 +674,11 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				"ms3": 2, // 1 replica without machine, it can be scaled down to 2 without any impact on availability (-1); even if there is still room to scale down, we cannot further scale down ms3: 1 available replica from ms1 + 1 available replica from ms4 = 2 available replicas < minAvailability
 				// does not make sense to continue scale down.
 			},
+			expectedNotes: map[string][]string{
+				"ms1": {"scale down to align to existing Machines or scale down by removing unavailable replicas (and no available replicas exist on the MachineSet)"},
+				"ms2": {"scale down to align to existing Machines or scale down by removing unavailable replicas (and no available replicas exist on the MachineSet)"},
+				"ms3": {"scale down to align to existing Machines or scale down by removing unavailable replicas (and no available replicas exist on the MachineSet)"},
+			},
 		},
 		{
 			name:        "scale down replicas when there are more replicas than minAvailable replicas, scale down keeps into account scale downs from a previous reconcile",
@@ -621,6 +691,9 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 			expectScaleIntent: map[string]int32{
 				// new scale down intent for oldMSs:
 				"ms1": 2, // 4 available replicas from ms1 - 1 replica already scaling down from ms1 + 2 available replicas from ms2 = 5 available replicas > minAvailability, scale down to 2 (-1)
+			},
+			expectedNotes: map[string][]string{
+				"ms1": {"6 available replicas > 3 minimum available replicas"},
 			},
 		},
 		{
@@ -638,6 +711,9 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				// new scale down intent for oldMSs:
 				"ms1": 2, // 3 available replicas from ms1 + 2 available replicas from ms2 - 1 replica already scaling down from ms2 = 4 available replicas > minAvailability, scale down to 2 (-1)
 			},
+			expectedNotes: map[string][]string{
+				"ms1": {"5 available replicas > 3 minimum available replicas"},
+			},
 		},
 		{
 			name: "scale down replicas when there are more replicas than minAvailable replicas, scale down keeps into account scale downs from the current reconcile (oldMS is scaling down)",
@@ -653,6 +729,9 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				// new scale down intent for oldMSs:
 				"ms1": 1, // 3 available replicas from ms1 - 1 replica already scaling down from ms1 + 2 available replicas from ms2 = 4 available replicas > minAvailability, scale down to 1 (-1)
 			},
+			expectedNotes: map[string][]string{
+				"ms1": {"5 available replicas > 3 minimum available replicas"},
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -664,6 +743,7 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 				newMS:        tt.newMS,
 				oldMSs:       tt.oldMSs,
 				scaleIntents: tt.scaleIntent,
+				notes:        make(map[string][]string),
 			}
 			err := p.reconcileOldMachineSetsRollingUpdate(ctx)
 			g.Expect(err).ToNot(HaveOccurred())
@@ -687,6 +767,7 @@ func Test_reconcileOldMachineSetsRollingUpdate(t *testing.T) {
 			} else {
 				t.Logf("skipping MaxUnavailability check (totAvailableReplicas: %d, minAvailableReplicas: %d)", totAvailableReplicas, minAvailableReplicas)
 			}
+			g.Expect(p.notes).To(Equal(tt.expectedNotes), "unexpected notes")
 		})
 	}
 }
@@ -706,6 +787,7 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 		expectedCanUpdateCalls map[string]bool
 		expectMoveFromMS       []string
 		expectScaleIntents     map[string]int32
+		expectedNotes          map[string][]string
 	}{
 		// NewMS not scaling up
 
@@ -732,6 +814,9 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			},
 			expectMoveFromMS:   []string{"ms1"},
 			expectScaleIntents: map[string]int32{},
+			expectedNotes: map[string][]string{
+				"ms1": {"should scale down by moving Machines to MachineSet ms2"},
+			},
 		},
 		{
 			name:  "Do not move replicas from oldMS to newMS when newMS already have all the desired replicas",
@@ -754,6 +839,7 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			canUpdateAnswer:        map[string]bool{},
 			expectMoveFromMS:       []string{},
 			expectScaleIntents:     map[string]int32{},
+			expectedNotes:          map[string][]string{},
 		},
 		{
 			name:  "Do not move replicas from oldMS to newMS when oldMS doesn't have replicas anymore",
@@ -773,6 +859,7 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			canUpdateAnswer:        map[string]bool{},
 			expectMoveFromMS:       []string{},
 			expectScaleIntents:     map[string]int32{},
+			expectedNotes:          map[string][]string{},
 		},
 		{
 			name:  "Do not move replicas from oldMS to newMS when the system does not know if oldMS is eligible for in-place update", // Note: this should never happen, defensive programming.
@@ -791,6 +878,7 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			canUpdateAnswer:        map[string]bool{},
 			expectMoveFromMS:       []string{},
 			expectScaleIntents:     map[string]int32{},
+			expectedNotes:          map[string][]string{},
 		},
 		{
 			name:  "Do not move replicas from oldMS to newMS when oldMS is not eligible for in-place update",
@@ -811,6 +899,7 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			canUpdateAnswer:        map[string]bool{},
 			expectMoveFromMS:       []string{},
 			expectScaleIntents:     map[string]int32{},
+			expectedNotes:          map[string][]string{},
 		},
 		{
 			name:  "Do not move replicas from oldMS to newMS when canUpdateDecision for the oldMS is false",
@@ -835,6 +924,7 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			},
 			expectMoveFromMS:   []string{},
 			expectScaleIntents: map[string]int32{},
+			expectedNotes:      map[string][]string{},
 		},
 		{
 			name:  "Multiple oldMSs, mixed use cases",
@@ -874,6 +964,10 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			},
 			expectMoveFromMS:   []string{"ms1", "ms5"},
 			expectScaleIntents: map[string]int32{},
+			expectedNotes: map[string][]string{
+				"ms1": {"should scale down by moving Machines to MachineSet ms6"},
+				"ms5": {"should scale down by moving Machines to MachineSet ms6"},
+			},
 		},
 
 		// NewMS scaling up
@@ -905,6 +999,10 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			expectScaleIntents: map[string]int32{
 				"ms2": 2, // Scale intent not changed
 			},
+			expectedNotes: map[string][]string{
+				"ms1": {"should scale down by moving Machines to MachineSet ms2"},
+				"ms2": {"surge 1 allowed to create availability for in-place updates"},
+			},
 		},
 		{
 			name:  "When moving replicas from oldMS to newMS, preserve one usage of MaxSurge in the newMS scale up intent when required to start the rollout (maxSurge 1, maxUnavailable 0)",
@@ -934,6 +1032,10 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			expectScaleIntents: map[string]int32{
 				// "ms2": 1, +1 replica from maxSurge preserved, the rollout needs to start
 				"ms2": 1,
+			},
+			expectedNotes: map[string][]string{
+				"ms1": {"should scale down by moving Machines to MachineSet ms2"},
+				"ms2": {"surge 1 allowed to create availability for in-place updates"},
 			},
 		},
 		{
@@ -965,6 +1067,10 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 				// "ms2": 3, +2 replicas from maxSurge dropped, +1 replicas from maxSurge preserved, the rollout needs to start
 				"ms2": 1,
 			},
+			expectedNotes: map[string][]string{
+				"ms1": {"should scale down by moving Machines to MachineSet ms2"},
+				"ms2": {"surge 1 allowed to create availability for in-place updates"},
+			},
 		},
 		{
 			name:  "When moving replicas from oldMS to newMS, drop usage of MaxSurge in the newMS scale up intent when there are oldMS with scale down from a previous reconcile (maxSurge 3, maxUnavailable 1)",
@@ -980,7 +1086,7 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 				createM("m4", "ms1", "v1"),
 			},
 			scaleIntents: map[string]int32{
-				"ms2": 2, // +2 => MD expect 3, has currently 4 replicas, +2 replica it is using maxSurge 3
+				"ms2": 2, // +2 => MD expect 3, has currently 4 replicas, +2 replica it is using maxSurge 2
 			},
 			upToDateResults: map[string]mdutil.UpToDateResult{
 				"ms1": {EligibleForInPlaceUpdate: true},
@@ -993,7 +1099,11 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			},
 			expectMoveFromMS:   []string{"ms1"},
 			expectScaleIntents: map[string]int32{
-				// "ms2": 3, +3 replica using maxSurge dropped, oldMS is scaling down
+				// "ms2": 0, +2 replica using maxSurge dropped, oldMS is scaling down
+			},
+			expectedNotes: map[string][]string{
+				"ms1": {"should scale down by moving Machines to MachineSet ms2"},
+				"ms2": {"surge 2 dropped to prioritize in-place updates"},
 			},
 		},
 		{
@@ -1025,6 +1135,10 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			expectScaleIntents: map[string]int32{
 				// "ms2": 3, +3 replica using maxSurge dropped, oldMS is scaling down
 				"ms1": 2, // -1 due to maxUnavailable 1
+			},
+			expectedNotes: map[string][]string{
+				"ms1": {"should scale down by moving Machines to MachineSet ms2"},
+				"ms2": {"surge 3 dropped to prioritize in-place updates"},
 			},
 		},
 		{
@@ -1058,6 +1172,10 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			expectScaleIntents: map[string]int32{
 				// "ms2": 6, +3 replicas from maxSurge dropped, newMS is already scaling up
 			},
+			expectedNotes: map[string][]string{
+				"ms1": {"should scale down by moving Machines to MachineSet ms2"},
+				"ms2": {"surge 3 dropped to prioritize in-place updates"},
+			},
 		},
 		{
 			name:  "When moving replicas from oldMS to newMS, drop usage of MaxSurge in the newMS scale up intent when there are still not UpToDateReplicas on the newMS (maxSurge 1, maxUnavailable 0)",
@@ -1087,6 +1205,10 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			expectScaleIntents: map[string]int32{
 				// "ms2": 1, +1 replica using maxSurge dropped, there is a machine updating in place
 			},
+			expectedNotes: map[string][]string{
+				"ms1": {"should scale down by moving Machines to MachineSet ms2"},
+				"ms2": {"surge 1 dropped to prioritize in-place updates"},
+			},
 		},
 		{
 			name:  "When moving replicas from oldMS to newMS, drop usage of MaxSurge in the newMS scale up intent when there machines in-place updating (maxSurge 3, maxUnavailable 0)",
@@ -1114,7 +1236,11 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			},
 			expectMoveFromMS:   []string{"ms1"},
 			expectScaleIntents: map[string]int32{
-				// "ms2": 1, +1 replica using maxSurge dropped, there is a machine updating in place
+				// "ms2": 0, +3 replicas from maxSurge dropped, there is a machine updating in place
+			},
+			expectedNotes: map[string][]string{
+				"ms1": {"should scale down by moving Machines to MachineSet ms2"},
+				"ms2": {"surge 3 dropped to prioritize in-place updates"},
 			},
 		},
 		{
@@ -1145,6 +1271,10 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 			expectScaleIntents: map[string]int32{
 				// "ms2": 1, +1 replica using maxSurge dropped, there is a machine updating in place
 			},
+			expectedNotes: map[string][]string{
+				"ms1": {"should scale down by moving Machines to MachineSet ms2"},
+				"ms2": {"surge 1 dropped to prioritize in-place updates"},
+			},
 		},
 	}
 
@@ -1154,16 +1284,16 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 
 			canUpdateCalls := make(map[string]bool)
 
-			planner := newRolloutPlanner()
+			planner := newRolloutPlanner(nil, nil, nil)
 			planner.md = tc.md
 			planner.newMS = tc.newMS
 			planner.oldMSs = tc.oldMS
 			planner.machines = tc.machines
 			planner.scaleIntents = tc.scaleIntents
 			planner.upToDateResults = tc.upToDateResults
-			planner.overrideCanUpdateMachineSetInPlace = func(oldMS *clusterv1.MachineSet) bool {
+			planner.overrideCanUpdateMachineSetInPlace = func(_ context.Context, oldMS, _ *clusterv1.MachineSet) (bool, error) {
 				canUpdateCalls[oldMS.Name] = true
-				return tc.canUpdateAnswer[oldMS.Name]
+				return tc.canUpdateAnswer[oldMS.Name], nil
 			}
 
 			err := planner.reconcileInPlaceUpdateIntent(ctx)
@@ -1185,6 +1315,7 @@ func TestReconcileInPlaceUpdateIntent(t *testing.T) {
 					g.Expect(oldMS.Annotations).ToNot(HaveKey(clusterv1.MachineSetMoveMachinesToMachineSetAnnotation), "Unexpected annotation on oldMS")
 				}
 			}
+			g.Expect(planner.notes).To(Equal(tc.expectedNotes), "unexpected notes")
 		})
 	}
 }
@@ -1198,6 +1329,7 @@ func Test_reconcileDeadlockBreaker(t *testing.T) {
 		newMS                      *clusterv1.MachineSet
 		oldMSs                     []*clusterv1.MachineSet
 		expectScaleIntent          map[string]int32
+		expectedNotes              map[string][]string
 		skipMaxUnavailabilityCheck bool
 	}{
 		{
@@ -1210,6 +1342,7 @@ func Test_reconcileDeadlockBreaker(t *testing.T) {
 			expectScaleIntent: map[string]int32{
 				// no new scale down intent for oldMSs (ms1):
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name:        "no op if all the replicas on OldMS are available",
@@ -1221,6 +1354,7 @@ func Test_reconcileDeadlockBreaker(t *testing.T) {
 			expectScaleIntent: map[string]int32{
 				// no new scale down intent for oldMSs (ms1):
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name:        "no op if there are scale operation still in progress from a previous reconcile on newMS",
@@ -1232,6 +1366,7 @@ func Test_reconcileDeadlockBreaker(t *testing.T) {
 			expectScaleIntent: map[string]int32{
 				// no new scale down intent for oldMSs (ms1):
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name:        "no op if there are scale operation still in progress from a previous reconcile on oldMS",
@@ -1243,6 +1378,7 @@ func Test_reconcileDeadlockBreaker(t *testing.T) {
 			expectScaleIntent: map[string]int32{
 				// no new scale down intent for oldMSs (ms1):
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name: "no op if there are scale operation from the current reconcile on newMS",
@@ -1257,6 +1393,7 @@ func Test_reconcileDeadlockBreaker(t *testing.T) {
 				"ms2": 6,
 				// no new scale down intent for oldMSs (ms1):
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name: "no op if there are scale operation from the current reconcile on oldMS",
@@ -1271,6 +1408,7 @@ func Test_reconcileDeadlockBreaker(t *testing.T) {
 				// no new scale down intent for oldMSs (ms1):
 				"ms1": 4,
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name:        "wait for unavailable replicas on the newMS if any",
@@ -1282,6 +1420,7 @@ func Test_reconcileDeadlockBreaker(t *testing.T) {
 			expectScaleIntent: map[string]int32{
 				// no new scale down intent for oldMSs (ms1):
 			},
+			expectedNotes: map[string][]string{},
 		},
 		{
 			name:        "unblock a deadlock when necessary",
@@ -1294,6 +1433,9 @@ func Test_reconcileDeadlockBreaker(t *testing.T) {
 				// new scale down intent for oldMSs (ms1):
 				"ms1": 4,
 			},
+			expectedNotes: map[string][]string{
+				"ms2": {"scaling down by 1 to unblock rollout stuck due to unavailable Machine on oldMS"},
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -1304,9 +1446,11 @@ func Test_reconcileDeadlockBreaker(t *testing.T) {
 				newMS:        tt.newMS,
 				oldMSs:       tt.oldMSs,
 				scaleIntents: tt.scaleIntent,
+				notes:        make(map[string][]string),
 			}
 			p.reconcileDeadlockBreaker(ctx)
 			g.Expect(p.scaleIntents).To(Equal(tt.expectScaleIntent), "unexpected scaleIntents")
+			g.Expect(p.notes).To(Equal(tt.expectedNotes), "unexpected notes")
 		})
 	}
 }
@@ -1350,11 +1494,11 @@ type rollingUpdateSequenceTestCase struct {
 	// if this list contains new machines names (machine names not in currentMachineNames), it implies those machines have been created during a rollout;
 	// please name new machines names as "mX" where X is a progressive number starting after the max number in currentMachineNames (do not skip numbers),
 	// e.g. desiredMachineNames "m4","m5","m6" (desired machine names after a regular rollout of a MD with currentMachineNames "m1","m2","m3")
-	// e.g. desiredMachineNames "m1","m2","m3" (desired machine names after rollout performed using in-place upgrade for an MD with currentMachineNames "m1","m2","m3")
+	// e.g. desiredMachineNames "m1","m2","m3" (desired machine names after rollout performed using in-place update for an MD with currentMachineNames "m1","m2","m3")
 	desiredMachineNames []string
 
 	// overrideCanUpdateMachineSetInPlaceFunc allows to inject a function that will be used to perform the canUpdateMachineSetInPlace decision
-	overrideCanUpdateMachineSetInPlaceFunc func(oldMS *clusterv1.MachineSet) bool
+	overrideCanUpdateMachineSetInPlaceFunc func(ctx context.Context, oldMS, newMS *clusterv1.MachineSet) (bool, error)
 
 	// skipLogToFileAndGoldenFileCheck allows to skip storing the log to file and golden file Check.
 	// NOTE: this field is controlled by the test itself.
@@ -1384,9 +1528,6 @@ type rollingUpdateSequenceTestCase struct {
 
 func Test_RollingUpdateSequences(t *testing.T) {
 	utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.InPlaceUpdates, true)
-
-	ctx := context.Background()
-	ctx = ctrl.LoggerInto(ctx, textlogger.NewLogger(textlogger.NewConfig(textlogger.Verbosity(5), textlogger.Output(os.Stdout))))
 
 	tests := []rollingUpdateSequenceTestCase{
 		// Regular rollout (no in-place)
@@ -1730,7 +1871,7 @@ func runRollingUpdateTestCase(ctx context.Context, t *testing.T, tt rollingUpdat
 	desired := computeDesiredRolloutScope(current, tt.desiredMachineNames)
 
 	// Log initial state
-	fLogger.Logf("[Test] Initial state\n%s", current)
+	fLogger.Logf("[Test] Initial state\n%s", current.summary())
 	random := ""
 	if tt.randomControllerOrder {
 		random = fmt.Sprintf(", random(%d)", tt.seed)
@@ -1749,11 +1890,13 @@ func runRollingUpdateTestCase(ctx context.Context, t *testing.T, tt rollingUpdat
 			task := taskList[taskID]
 			if task == "md" {
 				fLogger.Logf("[MD controller] Iteration %d, Reconcile md", i)
-				fLogger.Logf("[MD controller] - Input to rollout planner\n%s", current)
 
 				// Running a small subset of MD reconcile (the rollout logic and a bit of setReplicas)
-				p := newRolloutPlanner()
-				p.overrideCanUpdateMachineSetInPlace = tt.overrideCanUpdateMachineSetInPlaceFunc
+				p := newRolloutPlanner(nil, nil, nil)
+				p.overrideCanUpdateMachineSetInPlace = func(_ context.Context, _, _ *clusterv1.MachineSet) (bool, error) { return false, nil }
+				if tt.overrideCanUpdateMachineSetInPlaceFunc != nil {
+					p.overrideCanUpdateMachineSetInPlace = tt.overrideCanUpdateMachineSetInPlaceFunc
+				}
 				p.overrideComputeDesiredMS = func(ctx context.Context, deployment *clusterv1.MachineDeployment, currentNewMS *clusterv1.MachineSet) (*clusterv1.MachineSet, error) {
 					log := ctrl.LoggerFrom(ctx)
 					desiredNewMS := currentNewMS
@@ -1784,9 +1927,10 @@ func runRollingUpdateTestCase(ctx context.Context, t *testing.T, tt rollingUpdat
 				// Running a small subset of setReplicas (we don't want to run the full func to avoid unnecessary noise on the test)
 				current.machineDeployment.Status.Replicas = mdutil.GetActualReplicaCountForMachineSets(current.machineSets)
 				current.machineDeployment.Status.AvailableReplicas = mdutil.GetAvailableReplicaCountForMachineSets(current.machineSets)
+				current.machineDeployment.Status.UpToDateReplicas = mdutil.GetUptoDateReplicaCountForMachineSets(current.machineSets)
 
 				// Log state after this reconcile
-				fLogger.Logf("[MD controller] - Result of rollout planner\n%s", current)
+				fLogger.Logf("[MD controller] - Result of rollout planner\n%s", current.rolloutPlannerResultSummary(p))
 
 				// Check we are not breaching rollout constraints
 				minAvailableReplicas := ptr.Deref(current.machineDeployment.Spec.Replicas, 0) - mdutil.MaxUnavailable(*current.machineDeployment)
@@ -1817,7 +1961,7 @@ func runRollingUpdateTestCase(ctx context.Context, t *testing.T, tt rollingUpdat
 			// Run mutators faking other controllers
 			for _, ms := range current.machineSets {
 				if ms.Name == task {
-					fLogger.Logf("[MS controller] Iteration %d, Reconcile %s, %s", i, ms.Name, msLog(ms, current.machineSetMachines[ms.Name]))
+					fLogger.Logf("[MS controller] Iteration %d, Reconcile %s", i, current.machineSetSummary(ms))
 					err := machineSetControllerMutator(fLogger, ms, current)
 					g.Expect(err).ToNot(HaveOccurred())
 					break
@@ -1827,7 +1971,7 @@ func runRollingUpdateTestCase(ctx context.Context, t *testing.T, tt rollingUpdat
 
 		// Check if we are at the desired state
 		if current.Equal(desired) {
-			fLogger.Logf("[Test] Final state\n%s", current)
+			fLogger.Logf("[Test] Final state\n%s", current.summary())
 			break
 		}
 
@@ -1837,7 +1981,7 @@ func runRollingUpdateTestCase(ctx context.Context, t *testing.T, tt rollingUpdat
 			// NOTE: the following can be used to set a breakpoint for debugging why the system is not reaching desired state after maxIterations (to check what is not yet equal)
 			current.Equal(desired)
 			// Log desired state we never reached
-			fLogger.Logf("[Test] Desired state\n%s", desired)
+			fLogger.Logf("[Test] Desired state\n%s", desired.summary())
 			g.Fail(fmt.Sprintf("Failed to reach desired state in %d iterations", maxIterations))
 		}
 	}
@@ -1849,8 +1993,8 @@ func runRollingUpdateTestCase(ctx context.Context, t *testing.T, tt rollingUpdat
 	}
 }
 
-func oldMSCanAlwaysUpdateInPlace(_ *clusterv1.MachineSet) bool {
-	return true
+func oldMSCanAlwaysUpdateInPlace(_ context.Context, _, _ *clusterv1.MachineSet) (bool, error) {
+	return true, nil
 }
 
 func maxUnavailableBreachToleration() func(log *fileLogger, _ int, _ *rolloutScope, _, _ int32) bool {

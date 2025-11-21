@@ -1171,12 +1171,11 @@ func TestSetNodeHealthyAndReadyConditions(t *testing.T) {
 
 func TestDeletingCondition(t *testing.T) {
 	testCases := []struct {
-		name                    string
-		machine                 *clusterv1.Machine
-		reconcileDeleteExecuted bool
-		deletingReason          string
-		deletingMessage         string
-		expectCondition         metav1.Condition
+		name            string
+		machine         *clusterv1.Machine
+		deletingReason  string
+		deletingMessage string
+		expectCondition metav1.Condition
 	}{
 		{
 			name: "deletionTimestamp not set",
@@ -1186,9 +1185,8 @@ func TestDeletingCondition(t *testing.T) {
 					Namespace: metav1.NamespaceDefault,
 				},
 			},
-			reconcileDeleteExecuted: false,
-			deletingReason:          "",
-			deletingMessage:         "",
+			deletingReason:  "",
+			deletingMessage: "",
 			expectCondition: metav1.Condition{
 				Type:   clusterv1.MachineDeletingCondition,
 				Status: metav1.ConditionFalse,
@@ -1204,9 +1202,8 @@ func TestDeletingCondition(t *testing.T) {
 					DeletionTimestamp: &metav1.Time{Time: time.Now()},
 				},
 			},
-			reconcileDeleteExecuted: true,
-			deletingReason:          clusterv1.MachineDeletingWaitingForPreDrainHookReason,
-			deletingMessage:         "Waiting for pre-drain hooks to succeed (hooks: test-hook)",
+			deletingReason:  clusterv1.MachineDeletingWaitingForPreDrainHookReason,
+			deletingMessage: "Waiting for pre-drain hooks to succeed (hooks: test-hook)",
 			expectCondition: metav1.Condition{
 				Type:    clusterv1.MachineDeletingCondition,
 				Status:  metav1.ConditionTrue,
@@ -1223,8 +1220,7 @@ func TestDeletingCondition(t *testing.T) {
 					DeletionTimestamp: &metav1.Time{Time: time.Now()},
 				},
 			},
-			reconcileDeleteExecuted: true,
-			deletingReason:          clusterv1.MachineDeletingDrainingNodeReason,
+			deletingReason: clusterv1.MachineDeletingDrainingNodeReason,
 			deletingMessage: `Drain not completed yet (started at 2024-10-09T16:13:59Z):
 * Pods with deletionTimestamp that still exist: pod-2-deletionTimestamp-set-1, pod-2-deletionTimestamp-set-2, pod-2-deletionTimestamp-set-3, pod-3-to-trigger-eviction-successfully-1, pod-3-to-trigger-eviction-successfully-2, ... (2 more)
 * Pods with eviction failed:
@@ -1249,43 +1245,13 @@ func TestDeletingCondition(t *testing.T) {
   * ... (1 more error applying to 1 Pod)`,
 			},
 		},
-		{
-			name: "deletionTimestamp set, reconcileDelete not executed",
-			machine: &clusterv1.Machine{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:              "machine-test",
-					Namespace:         metav1.NamespaceDefault,
-					DeletionTimestamp: &metav1.Time{Time: time.Now()},
-				},
-				Status: clusterv1.MachineStatus{
-					Conditions: []metav1.Condition{
-						{
-							Type:    clusterv1.MachineDeletingCondition,
-							Status:  metav1.ConditionTrue,
-							Reason:  clusterv1.MachineDeletingWaitingForPreDrainHookReason,
-							Message: "Waiting for pre-drain hooks to succeed (hooks: test-hook)",
-						},
-					},
-				},
-			},
-			reconcileDeleteExecuted: false,
-			deletingReason:          "",
-			deletingMessage:         "",
-			// Condition was not updated because reconcileDelete was not executed.
-			expectCondition: metav1.Condition{
-				Type:    clusterv1.MachineDeletingCondition,
-				Status:  metav1.ConditionTrue,
-				Reason:  clusterv1.MachineDeletingWaitingForPreDrainHookReason,
-				Message: "Waiting for pre-drain hooks to succeed (hooks: test-hook)",
-			},
-		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			setDeletingCondition(ctx, tc.machine, tc.reconcileDeleteExecuted, tc.deletingReason, tc.deletingMessage)
+			setDeletingCondition(ctx, tc.machine, tc.deletingReason, tc.deletingMessage)
 
 			deletingCondition := conditions.Get(tc.machine, clusterv1.MachineDeletingCondition)
 			g.Expect(deletingCondition).ToNot(BeNil())
@@ -1579,9 +1545,49 @@ func TestSetUpToDateCondition(t *testing.T) {
 				},
 			},
 			expectCondition: &metav1.Condition{
-				Type:   clusterv1.MachineUpToDateCondition,
-				Status: metav1.ConditionFalse,
-				Reason: clusterv1.MachineUpToDateUpdatingReason,
+				Type:    clusterv1.MachineUpToDateCondition,
+				Status:  metav1.ConditionFalse,
+				Reason:  clusterv1.MachineUpToDateUpdatingReason,
+				Message: "* In-place update in progress",
+			},
+		},
+		{
+			name: "updating (message from Updating)",
+			machineDeployment: &clusterv1.MachineDeployment{
+				Spec: clusterv1.MachineDeploymentSpec{
+					Template: clusterv1.MachineTemplateSpec{
+						Spec: clusterv1.MachineSpec{
+							Version: "v1.31.0",
+						},
+					},
+				},
+			},
+			machineSet: &clusterv1.MachineSet{
+				Spec: clusterv1.MachineSetSpec{
+					Template: clusterv1.MachineTemplateSpec{
+						Spec: clusterv1.MachineSpec{
+							Version: "v1.31.0",
+						},
+					},
+				},
+			},
+			machine: &clusterv1.Machine{
+				Status: clusterv1.MachineStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    clusterv1.MachineUpdatingCondition,
+							Status:  metav1.ConditionTrue,
+							Reason:  clusterv1.MachineInPlaceUpdatingReason,
+							Message: "In-place update in progress: Extension is updating Machine",
+						},
+					},
+				},
+			},
+			expectCondition: &metav1.Condition{
+				Type:    clusterv1.MachineUpToDateCondition,
+				Status:  metav1.ConditionFalse,
+				Reason:  clusterv1.MachineUpToDateUpdatingReason,
+				Message: "* In-place update in progress: Extension is updating Machine",
 			},
 		},
 		{
@@ -1893,7 +1899,7 @@ func TestSetReadyCondition(t *testing.T) {
 							Type:    clusterv1.MachineUpdatingCondition,
 							Status:  metav1.ConditionTrue,
 							Reason:  clusterv1.MachineInPlaceUpdatingReason,
-							Message: "In place update in progress",
+							Message: "In-place update in progress",
 						},
 					},
 				},
@@ -1902,7 +1908,7 @@ func TestSetReadyCondition(t *testing.T) {
 				Type:    clusterv1.MachineReadyCondition,
 				Status:  metav1.ConditionFalse,
 				Reason:  clusterv1.MachineNotReadyReason,
-				Message: "* Updating: In place update in progress",
+				Message: "* Updating: In-place update in progress",
 			},
 		},
 		{
@@ -2531,7 +2537,7 @@ func TestReconcileMachinePhases(t *testing.T) {
 
 		// Wait until InfraMachine has the ownerReference.
 		g.Eventually(func(g Gomega) bool {
-			if err := env.DirectAPIServerGet(ctx, client.ObjectKeyFromObject(infraMachine), infraMachine); err != nil {
+			if err := env.Get(ctx, client.ObjectKeyFromObject(infraMachine), infraMachine); err != nil {
 				return false
 			}
 			g.Expect(infraMachine.GetOwnerReferences()).To(HaveLen(1))
@@ -2574,7 +2580,7 @@ func TestReconcileMachinePhases(t *testing.T) {
 
 		// Wait until Machine was reconciled.
 		g.Eventually(func(g Gomega) bool {
-			if err := env.DirectAPIServerGet(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
+			if err := env.Get(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
 				return false
 			}
 			g.Expect(machine.Status.GetTypedPhase()).To(Equal(clusterv1.MachinePhasePending))
@@ -2629,7 +2635,7 @@ func TestReconcileMachinePhases(t *testing.T) {
 
 		// Wait until Machine was reconciled.
 		g.Eventually(func(g Gomega) bool {
-			if err := env.DirectAPIServerGet(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
+			if err := env.Get(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
 				return false
 			}
 			g.Expect(machine.Status.GetTypedPhase()).To(Equal(clusterv1.MachinePhaseProvisioning))
@@ -2719,7 +2725,7 @@ func TestReconcileMachinePhases(t *testing.T) {
 
 		// Wait until Machine was reconciled.
 		g.Eventually(func(g Gomega) bool {
-			if err := env.DirectAPIServerGet(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
+			if err := env.Get(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
 				return false
 			}
 			g.Expect(machine.Status.Addresses).To(HaveLen(2))
@@ -2799,7 +2805,7 @@ func TestReconcileMachinePhases(t *testing.T) {
 
 		// Wait until Machine was reconciled.
 		g.Eventually(func(g Gomega) bool {
-			if err := env.DirectAPIServerGet(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
+			if err := env.Get(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
 				return false
 			}
 			g.Expect(machine.Status.GetTypedPhase()).To(Equal(clusterv1.MachinePhaseRunning))
@@ -2878,7 +2884,7 @@ func TestReconcileMachinePhases(t *testing.T) {
 
 		// Wait until Machine was reconciled.
 		g.Eventually(func(g Gomega) bool {
-			if err := env.DirectAPIServerGet(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
+			if err := env.Get(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
 				return false
 			}
 			g.Expect(machine.Status.GetTypedPhase()).To(Equal(clusterv1.MachinePhaseRunning))
@@ -2976,7 +2982,7 @@ func TestReconcileMachinePhases(t *testing.T) {
 
 		// Wait until Machine was reconciled.
 		g.Eventually(func(g Gomega) bool {
-			if err := env.DirectAPIServerGet(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
+			if err := env.Get(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
 				return false
 			}
 			g.Expect(machine.Status.GetTypedPhase()).To(Equal(clusterv1.MachinePhaseUpdating))
@@ -3039,7 +3045,7 @@ func TestReconcileMachinePhases(t *testing.T) {
 
 		// Wait until Machine was reconciled.
 		g.Eventually(func(g Gomega) bool {
-			if err := env.DirectAPIServerGet(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
+			if err := env.Get(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
 				return false
 			}
 			g.Expect(machine.Status.GetTypedPhase()).To(Equal(clusterv1.MachinePhaseProvisioned))
@@ -3133,7 +3139,7 @@ func TestReconcileMachinePhases(t *testing.T) {
 
 		// Wait until Machine was reconciled.
 		g.Eventually(func(g Gomega) bool {
-			if err := env.DirectAPIServerGet(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
+			if err := env.Get(ctx, client.ObjectKeyFromObject(machine), machine); err != nil {
 				return false
 			}
 			g.Expect(machine.Status.GetTypedPhase()).To(Equal(clusterv1.MachinePhaseDeleting))

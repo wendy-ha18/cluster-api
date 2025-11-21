@@ -31,6 +31,10 @@ GO_CONTAINER_IMAGE ?= docker.io/library/golang:$(GO_VERSION)
 GOTOOLCHAIN = go$(GO_VERSION)
 export GOTOOLCHAIN
 
+# Required with Go 1.24 to enable usage of synctest in unit tests
+# Can be removed after we bumped to Go 1.25.
+export GOEXPERIMENT=synctest
+
 # Use GOPROXY environment variable if set
 GOPROXY := $(shell go env GOPROXY)
 ifeq ($(GOPROXY),)
@@ -603,6 +607,7 @@ generate-e2e-templates-v1.11: $(KUSTOMIZE)
 generate-e2e-templates-main: $(KUSTOMIZE)
 	$(KUSTOMIZE) build $(DOCKER_TEMPLATES)/main/cluster-template --load-restrictor LoadRestrictionsNone > $(DOCKER_TEMPLATES)/main/cluster-template.yaml
 	$(KUSTOMIZE) build $(DOCKER_TEMPLATES)/main/cluster-template-md-remediation --load-restrictor LoadRestrictionsNone > $(DOCKER_TEMPLATES)/main/cluster-template-md-remediation.yaml
+	$(KUSTOMIZE) build $(DOCKER_TEMPLATES)/main/cluster-template-md-taints --load-restrictor LoadRestrictionsNone > $(DOCKER_TEMPLATES)/main/cluster-template-md-taints.yaml
 	$(KUSTOMIZE) build $(DOCKER_TEMPLATES)/main/cluster-template-kcp-remediation --load-restrictor LoadRestrictionsNone > $(DOCKER_TEMPLATES)/main/cluster-template-kcp-remediation.yaml
 	$(KUSTOMIZE) build $(DOCKER_TEMPLATES)/main/cluster-template-kcp-adoption/step1 --load-restrictor LoadRestrictionsNone > $(DOCKER_TEMPLATES)/main/cluster-template-kcp-adoption.yaml
 	echo "---" >> $(DOCKER_TEMPLATES)/main/cluster-template-kcp-adoption.yaml

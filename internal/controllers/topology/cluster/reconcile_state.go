@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -37,6 +38,7 @@ import (
 	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
+	runtimecatalog "sigs.k8s.io/cluster-api/exp/runtime/catalog"
 	"sigs.k8s.io/cluster-api/exp/topology/scope"
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/internal/contract"
@@ -48,6 +50,7 @@ import (
 	"sigs.k8s.io/cluster-api/internal/topology/ownerrefs"
 	clientutil "sigs.k8s.io/cluster-api/internal/util/client"
 	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/cache"
 )
 
 const (
@@ -186,7 +189,7 @@ func (r *Reconciler) callAfterHooks(ctx context.Context, s *scope.Scope) error {
 func (r *Reconciler) callAfterControlPlaneInitialized(ctx context.Context, s *scope.Scope) error {
 	// If the cluster topology is being created then track to intent to call the AfterControlPlaneInitialized hook so that we can call it later.
 	if !s.Current.Cluster.Spec.InfrastructureRef.IsDefined() && !s.Current.Cluster.Spec.ControlPlaneRef.IsDefined() {
-		if err := hooks.MarkAsPending(ctx, r.Client, s.Current.Cluster, runtimehooksv1.AfterControlPlaneInitialized); err != nil {
+		if err := hooks.MarkAsPending(ctx, r.Client, s.Current.Cluster, false, runtimehooksv1.AfterControlPlaneInitialized); err != nil {
 			return err
 		}
 	}
@@ -210,7 +213,7 @@ func (r *Reconciler) callAfterControlPlaneInitialized(ctx context.Context, s *sc
 				return err
 			}
 			s.HookResponseTracker.Add(runtimehooksv1.AfterControlPlaneInitialized, hookResponse)
-			if err := hooks.MarkAsDone(ctx, r.Client, s.Current.Cluster, runtimehooksv1.AfterControlPlaneInitialized); err != nil {
+			if err := hooks.MarkAsDone(ctx, r.Client, s.Current.Cluster, false, runtimehooksv1.AfterControlPlaneInitialized); err != nil {
 				return err
 			}
 		}
@@ -231,6 +234,8 @@ func isControlPlaneInitialized(cluster *clusterv1.Cluster) bool {
 }
 
 func (r *Reconciler) callAfterClusterUpgrade(ctx context.Context, s *scope.Scope) error {
+	log := ctrl.LoggerFrom(ctx)
+
 	// Call the hook only if we are tracking the intent to do so. If it is not tracked it means we don't need to call the
 	// hook because we didn't go through an upgrade or we already called the hook after the upgrade.
 	// Note: also check that the AfterControlPlaneUpgrade hooks and the AfterWorkersUpgrade hooks already have been called.
@@ -242,16 +247,33 @@ func (r *Reconciler) callAfterClusterUpgrade(ctx context.Context, s *scope.Scope
 		// - MachineDeployments/MachinePools are not pending an upgrade
 		// - MachineDeployments/MachinePools are not pending create
 		if s.UpgradeTracker.ControlPlane.IsControlPlaneStable() && // Control Plane stable checks
-			len(s.UpgradeTracker.MachineDeployments.UpgradingNames()) == 0 && // Machine deployments are not upgrading or not about to upgrade
+			!s.UpgradeTracker.MachineDeployments.IsAnyUpgrading() && // Machine deployments are not upgrading or not about to upgrade
 			!s.UpgradeTracker.MachineDeployments.IsAnyPendingCreate() && // No MachineDeployments are pending create
 			!s.UpgradeTracker.MachineDeployments.IsAnyPendingUpgrade() && // No MachineDeployments are pending an upgrade
-			!s.UpgradeTracker.MachineDeployments.DeferredUpgrade() && // No MachineDeployments have deferred an upgrade
-			len(s.UpgradeTracker.MachinePools.UpgradingNames()) == 0 && // Machine pools are not upgrading or not about to upgrade
+			!s.UpgradeTracker.MachineDeployments.IsAnyUpgradeDeferred() && // No MachineDeployments have deferred an upgrade
+			!s.UpgradeTracker.MachinePools.IsAnyUpgrading() && // Machine pools are not upgrading or not about to upgrade
 			!s.UpgradeTracker.MachinePools.IsAnyPendingCreate() && // No MachinePools are pending create
 			!s.UpgradeTracker.MachinePools.IsAnyPendingUpgrade() && // No MachinePools are pending an upgrade
-			!s.UpgradeTracker.MachinePools.DeferredUpgrade() { // No MachinePools have deferred an upgrade
-			v1beta1Cluster := &clusterv1beta1.Cluster{}
+			!s.UpgradeTracker.MachinePools.IsAnyUpgradeDeferred() { // No MachinePools have deferred an upgrade
+			// Return quickly if the hook is not defined.
+			extensionHandlers, err := r.RuntimeClient.GetAllExtensions(ctx, runtimehooksv1.AfterClusterUpgrade, s.Current.Cluster)
+			if err != nil {
+				return err
+			}
+			if len(extensionHandlers) == 0 {
+				return hooks.MarkAsDone(ctx, r.Client, s.Current.Cluster, false, runtimehooksv1.AfterClusterUpgrade)
+			}
+
+			if cacheEntry, ok := r.hookCache.Has(cache.NewHookEntryKey(s.Current.Cluster, runtimehooksv1.AfterClusterUpgrade)); ok {
+				if requeueAfter, requeue := cacheEntry.ShouldRequeue(time.Now()); requeue {
+					log.V(5).Info(fmt.Sprintf("Skip calling AfterClusterUpgrade hook, retry after %s", requeueAfter))
+					s.HookResponseTracker.Add(runtimehooksv1.AfterClusterUpgrade, cacheEntry.ToResponse(&runtimehooksv1.AfterClusterUpgradeResponse{}, requeueAfter))
+					return nil
+				}
+			}
+
 			// DeepCopy cluster because ConvertFrom has side effects like adding the conversion annotation.
+			v1beta1Cluster := &clusterv1beta1.Cluster{}
 			if err := v1beta1Cluster.ConvertFrom(s.Current.Cluster.DeepCopy()); err != nil {
 				return errors.Wrap(err, "error converting Cluster to v1beta1 Cluster")
 			}
@@ -266,10 +288,19 @@ func (r *Reconciler) callAfterClusterUpgrade(ctx context.Context, s *scope.Scope
 				return err
 			}
 			s.HookResponseTracker.Add(runtimehooksv1.AfterClusterUpgrade, hookResponse)
+
+			if hookResponse.RetryAfterSeconds != 0 {
+				r.hookCache.Add(cache.NewHookEntry(s.Current.Cluster, runtimehooksv1.AfterClusterUpgrade, time.Now().Add(time.Duration(hookResponse.RetryAfterSeconds)*time.Second), hookResponse.GetMessage()))
+				log.Info(fmt.Sprintf("Cluster upgrade to version %s completed but next upgrades are blocked by %s hook, retry after %ds", hookRequest.KubernetesVersion, runtimecatalog.HookName(runtimehooksv1.AfterClusterUpgrade), hookResponse.RetryAfterSeconds))
+				return nil
+			}
+
 			// The hook is successfully called; we can remove this hook from the list of pending-hooks.
-			if err := hooks.MarkAsDone(ctx, r.Client, s.Current.Cluster, runtimehooksv1.AfterClusterUpgrade); err != nil {
+			if err := hooks.MarkAsDone(ctx, r.Client, s.Current.Cluster, false, runtimehooksv1.AfterClusterUpgrade); err != nil {
 				return err
 			}
+
+			log.Info(fmt.Sprintf("Cluster upgrade to version %s and %s hook completed", hookRequest.KubernetesVersion, runtimecatalog.HookName(runtimehooksv1.AfterClusterUpgrade)))
 		}
 	}
 
@@ -673,7 +704,7 @@ func (r *Reconciler) createMachineDeployment(ctx context.Context, s *scope.Scope
 	// Wait until MachineDeployment is visible in the cache.
 	// Note: We have to do this because otherwise using a cached client in current state could
 	// miss a newly created MachineDeployment (because the cache might be stale).
-	if err := clientutil.WaitForCacheToBeUpToDate(ctx, r.Client, "MachineDeployment creation", md.Object); err != nil {
+	if err := clientutil.WaitForObjectsToBeAddedToTheCache(ctx, r.Client, "MachineDeployment creation", md.Object); err != nil {
 		return err
 	}
 
@@ -996,7 +1027,7 @@ func (r *Reconciler) createMachinePool(ctx context.Context, s *scope.Scope, mp *
 	// Wait until MachinePool is visible in the cache.
 	// Note: We have to do this because otherwise using a cached client in current state could
 	// miss a newly created MachinePool (because the cache might be stale).
-	return clientutil.WaitForCacheToBeUpToDate(ctx, r.Client, "MachinePool creation", mp.Object)
+	return clientutil.WaitForObjectsToBeAddedToTheCache(ctx, r.Client, "MachinePool creation", mp.Object)
 }
 
 // updateMachinePool updates a MachinePool. Also updates the corresponding objects if necessary.

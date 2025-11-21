@@ -40,8 +40,8 @@ func (r *KubeadmControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context
 		return r.overrideTriggerInPlaceUpdate(ctx, machine, machineUpToDateResult)
 	}
 
-	log := ctrl.LoggerFrom(ctx)
-	log.Info("Triggering in-place update", "Machine", klog.KObj(machine))
+	log := ctrl.LoggerFrom(ctx).WithValues("Machine", klog.KObj(machine))
+	log.Info(fmt.Sprintf("Triggering in-place update for Machine %s", machine.Name))
 
 	// Mark Machine for in-place update.
 	// Note: Once we write UpdateInProgressAnnotation we will always continue with the in-place update.
@@ -129,11 +129,12 @@ func (r *KubeadmControlPlaneReconciler) triggerInPlaceUpdate(ctx context.Context
 	// Note: Intentionally using client.Patch (via hooks.MarkAsPending + patchHelper) instead of SSA. Otherwise we would
 	//       have to ensure we preserve PendingHooksAnnotation on existing Machines in KCP and that would lead to race
 	//       conditions when the Machine controller tries to remove the annotation and KCP adds it back.
-	if err := hooks.MarkAsPending(ctx, r.Client, desiredMachine, runtimehooksv1.UpdateMachine); err != nil {
+	// Note: This call will update the resourceVersion on desiredMachine, so that WaitForCacheToBeUpToDate also considers this change.
+	if err := hooks.MarkAsPending(ctx, r.Client, desiredMachine, true, runtimehooksv1.UpdateMachine); err != nil {
 		return errors.Wrapf(err, "failed to complete triggering in-place update for Machine %s", klog.KObj(machine))
 	}
 
-	log.Info("Completed triggering in-place update", "Machine", klog.KObj(machine))
+	log.Info(fmt.Sprintf("Completed triggering in-place update for Machine %s", machine.Name))
 	r.recorder.Event(machine, corev1.EventTypeNormal, "SuccessfulStartInPlaceUpdate", "Machine starting in-place update")
 
 	// Wait until the cache observed the Machine with PendingHooksAnnotation to ensure subsequent reconciles

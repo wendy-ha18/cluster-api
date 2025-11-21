@@ -32,6 +32,7 @@ import (
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/internal/controllers/machinedeployment/mdutil"
+	clientutil "sigs.k8s.io/cluster-api/internal/util/client"
 	"sigs.k8s.io/cluster-api/util/collections"
 	v1beta1conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 	"sigs.k8s.io/cluster-api/util/patch"
@@ -44,7 +45,7 @@ func (r *Reconciler) sync(ctx context.Context, md *clusterv1.MachineDeployment, 
 	// - identifying newMS and OldMS when necessary
 	// - computing desired state for newMS and OldMS, including managing rollout related annotations and
 	//   in-place propagation of labels, annotations and other fields.
-	planner := newRolloutPlanner()
+	planner := newRolloutPlanner(r.Client, r.RuntimeClient, r.canUpdateMachineSetCache)
 	if err := planner.init(ctx, md, msList, machines.UnsortedList(), false, templateExists); err != nil {
 		return err
 	}
@@ -69,7 +70,7 @@ func (r *Reconciler) sync(ctx context.Context, md *clusterv1.MachineDeployment, 
 	oldMSs := planner.oldMSs
 	allMSs := append(oldMSs, newMS)
 
-	// TODO(in-place): consider if to move the scale logic to the rollout planner as well, so we can improve test coverage
+	// Note: Consider if to move the scale logic to the rollout planner as well, so we can improve test coverage
 	//  like we did for RolloutUpdate and OnDelete strategy.
 	if err := r.scale(ctx, md, newMS, oldMSs); err != nil {
 		// If we get an error while trying to scale, the deployment will be requeued
@@ -333,8 +334,8 @@ func (r *Reconciler) cleanupDeployment(ctx context.Context, oldMSs []*clusterv1.
 	}
 
 	sort.Sort(mdutil.MachineSetsByCreationTimestamp(cleanableMSes))
-	log.V(4).Info("Looking to cleanup old machine sets for deployment")
 
+	machineSetsDeleted := []*clusterv1.MachineSet{}
 	for i := range cleanableMSCount {
 		ms := cleanableMSes[i]
 		if ms.Spec.Replicas == nil {
@@ -346,17 +347,18 @@ func (r *Reconciler) cleanupDeployment(ctx context.Context, oldMSs []*clusterv1.
 			continue
 		}
 
-		log.V(4).Info("Trying to cleanup machine set for deployment", "MachineSet", klog.KObj(ms))
 		if err := r.Client.Delete(ctx, ms); err != nil && !apierrors.IsNotFound(err) {
 			// Return error instead of aggregating and continuing DELETEs on the theory
 			// that we may be overloading the api server.
 			r.recorder.Eventf(deployment, corev1.EventTypeWarning, "FailedDelete", "Failed to delete MachineSet %q: %v", ms.Name, err)
-			return err
+			return errors.Wrapf(err, "failed to delete MachineSet %s (cleanup of old MachineSets)", klog.KObj(ms))
 		}
+		machineSetsDeleted = append(machineSetsDeleted, ms)
+
 		// Note: We intentionally log after Delete because we want this log line to show up only after DeletionTimestamp has been set.
-		log.Info("Deleting MachineSet (cleanup of old MachineSet)", "MachineSet", klog.KObj(ms))
+		log.Info(fmt.Sprintf("MachineSet %s deleting (cleanup of old MachineSets)", ms.Name), "MachineSet", klog.KObj(ms))
 		r.recorder.Eventf(deployment, corev1.EventTypeNormal, "SuccessfulDelete", "Deleted MachineSet %q", ms.Name)
 	}
 
-	return nil
+	return clientutil.WaitForObjectsToBeDeletedFromTheCache(ctx, r.Client, "MachineSet deletion (cleanup of old MachineSet)", machineSetsDeleted...)
 }
