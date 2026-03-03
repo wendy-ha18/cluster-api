@@ -2,7 +2,7 @@
 
 clusterctl_cmd = "./bin/clusterctl"
 kubectl_cmd = "kubectl"
-kubernetes_version = "v1.34.0"
+kubernetes_version = "v1.35.0"
 
 load("ext://uibutton", "cmd_button", "location", "text_input")
 
@@ -172,9 +172,9 @@ def load_provider_tilt_files():
 
 tilt_helper_dockerfile_header = """
 # Tilt image
-FROM golang:1.24.10 as tilt-helper
+FROM golang:1.25.7 as tilt-helper
 # Install delve. Note this should be kept in step with the Go release minor version.
-RUN go install github.com/go-delve/delve/cmd/dlv@v1.24
+RUN go install github.com/go-delve/delve/cmd/dlv@v1.25
 # Support live reloading with Tilt
 RUN wget --output-document /restart.sh --quiet https://raw.githubusercontent.com/tilt-dev/rerun-process-wrapper/master/restart.sh  && \
     wget --output-document /start.sh --quiet https://raw.githubusercontent.com/tilt-dev/rerun-process-wrapper/master/start.sh && \
@@ -183,7 +183,7 @@ RUN wget --output-document /restart.sh --quiet https://raw.githubusercontent.com
 """
 
 tilt_dockerfile_header = """
-FROM golang:1.24.10 as tilt
+FROM golang:1.25.7 as tilt
 WORKDIR /
 COPY --from=tilt-helper /process.txt .
 COPY --from=tilt-helper /start.sh .
@@ -359,6 +359,9 @@ def enable_provider(name, debug):
     for resource in p_resources:
         k8s_yaml(p.get("context") + "/" + resource)
         additional_objs = additional_objs + decode_yaml_stream(read_file(p.get("context") + "/" + resource))
+
+    for resource in p.get("additional_uncategorized_resources", []):
+        k8s_yaml(p.get("context") + "/" + resource)
 
     if p.get("apply_provider_yaml", True):
         yaml = read_file("./.tiltbuild/yaml/{}.provider.yaml".format(name))

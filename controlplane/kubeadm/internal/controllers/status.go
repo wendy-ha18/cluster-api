@@ -852,7 +852,7 @@ func getPreflightMessages(cluster *clusterv1.Cluster, preflightChecks internal.P
 	additionalMessages := []string{}
 	if preflightChecks.TopologyVersionMismatch {
 		v := cluster.Spec.Topology.Version
-		if version, ok := cluster.GetAnnotations()[clusterv1.ClusterTopologyUpgradeStepAnnotation]; ok {
+		if version, ok := cluster.GetAnnotations()[clusterv1.ClusterTopologyUpgradeStepAnnotation]; ok && version != "" {
 			v = version
 		}
 		additionalMessages = append(additionalMessages, fmt.Sprintf("* waiting for a version upgrade to %s to be propagated", v))
@@ -860,6 +860,10 @@ func getPreflightMessages(cluster *clusterv1.Cluster, preflightChecks internal.P
 
 	if preflightChecks.HasDeletingMachine {
 		additionalMessages = append(additionalMessages, "* waiting for a control plane Machine to complete deletion")
+	}
+
+	if preflightChecks.CertificateMissing {
+		additionalMessages = append(additionalMessages, "* cluster certificates are missing or unknown")
 	}
 
 	if preflightChecks.ControlPlaneComponentsNotHealthy {

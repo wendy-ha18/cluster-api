@@ -35,7 +35,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	runtimecatalog "sigs.k8s.io/cluster-api/exp/runtime/catalog"
@@ -198,15 +197,9 @@ func (r *Reconciler) callAfterControlPlaneInitialized(ctx context.Context, s *sc
 	// hook because already called the hook after the control plane is initialized.
 	if hooks.IsPending(runtimehooksv1.AfterControlPlaneInitialized, s.Current.Cluster) {
 		if isControlPlaneInitialized(s.Current.Cluster) {
-			v1beta1Cluster := &clusterv1beta1.Cluster{}
-			// DeepCopy cluster because ConvertFrom has side effects like adding the conversion annotation.
-			if err := v1beta1Cluster.ConvertFrom(s.Current.Cluster.DeepCopy()); err != nil {
-				return errors.Wrap(err, "error converting Cluster to v1beta1 Cluster")
-			}
-
 			// The control plane is initialized for the first time. Call all the registered extensions for the hook.
 			hookRequest := &runtimehooksv1.AfterControlPlaneInitializedRequest{
-				Cluster: *cleanupCluster(v1beta1Cluster),
+				Cluster: *cleanupCluster(s.Current.Cluster),
 			}
 			hookResponse := &runtimehooksv1.AfterControlPlaneInitializedResponse{}
 			if err := r.RuntimeClient.CallAllExtensions(ctx, runtimehooksv1.AfterControlPlaneInitialized, s.Current.Cluster, hookRequest, hookResponse); err != nil {
@@ -272,15 +265,9 @@ func (r *Reconciler) callAfterClusterUpgrade(ctx context.Context, s *scope.Scope
 				}
 			}
 
-			// DeepCopy cluster because ConvertFrom has side effects like adding the conversion annotation.
-			v1beta1Cluster := &clusterv1beta1.Cluster{}
-			if err := v1beta1Cluster.ConvertFrom(s.Current.Cluster.DeepCopy()); err != nil {
-				return errors.Wrap(err, "error converting Cluster to v1beta1 Cluster")
-			}
-
 			// Everything is stable and the cluster can be considered fully upgraded.
 			hookRequest := &runtimehooksv1.AfterClusterUpgradeRequest{
-				Cluster:           *cleanupCluster(v1beta1Cluster),
+				Cluster:           *cleanupCluster(s.Current.Cluster),
 				KubernetesVersion: s.Current.Cluster.Spec.Topology.Version,
 			}
 			hookResponse := &runtimehooksv1.AfterClusterUpgradeResponse{}
@@ -464,7 +451,7 @@ func (r *Reconciler) reconcileMachineHealthCheck(ctx context.Context, current, d
 		if err != nil {
 			return errors.Wrapf(err, "failed to create patch helper for MachineHealthCheck %s", klog.KObj(desired))
 		}
-		if err := helper.Patch(ctx); err != nil {
+		if _, err := helper.Patch(ctx); err != nil {
 			return errors.Wrapf(err, "failed to create MachineHealthCheck %s", klog.KObj(desired))
 		}
 		r.recorder.Eventf(desired, corev1.EventTypeNormal, createEventReason, "Created MachineHealthCheck %q", klog.KObj(desired))
@@ -500,7 +487,7 @@ func (r *Reconciler) reconcileMachineHealthCheck(ctx context.Context, current, d
 	}
 
 	log.Info("Patching MachineHealthCheck")
-	if err := patchHelper.Patch(ctx); err != nil {
+	if _, err := patchHelper.Patch(ctx); err != nil {
 		return errors.Wrapf(err, "failed to patch MachineHealthCheck %s", klog.KObj(current))
 	}
 	r.recorder.Eventf(current, corev1.EventTypeNormal, updateEventReason, "Updated MachineHealthCheck %q", klog.KObj(current))
@@ -524,13 +511,15 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, s *scope.Scope) error
 		return nil
 	}
 
-	changes := patchHelper.Changes()
-	if len(changes) == 0 {
+	diff := patchHelper.Diff()
+	patchData := patchHelper.PatchData()
+	if diff == "" && patchData == "" {
 		log.Info("Patching Cluster")
 	} else {
-		log.Info("Patching Cluster", "diff", string(changes))
+		log.Info("Patching Cluster", "diff", diff, "patch", patchData)
 	}
-	if err := patchHelper.Patch(ctx); err != nil {
+	modifiedResourceVersion, err := patchHelper.Patch(ctx)
+	if err != nil {
 		return errors.Wrapf(err, "failed to patch Cluster %s", klog.KObj(s.Current.Cluster))
 	}
 	r.recorder.Eventf(s.Current.Cluster, corev1.EventTypeNormal, updateEventReason, "Updated Cluster %q", klog.KObj(s.Current.Cluster))
@@ -538,11 +527,10 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, s *scope.Scope) error
 	// Wait until Cluster is updated in the cache.
 	// Note: We have to do this because otherwise using a cached client in the Reconcile func could
 	// return a stale state of the Cluster we just patched (because the cache might be stale).
-	// Note: It is good enough to check that the resource version changed. Other controllers might have updated the
-	// Cluster as well, but the combination of the patch call above without a conflict and a changed resource
-	// version here guarantees that we see the changes of our own update.
 	// Note: Using DeepCopy to not modify s.Current.Cluster as it's not trivial to figure out what impact that would have.
-	return clientutil.WaitForCacheToBeUpToDate(ctx, r.Client, "Cluster update", s.Current.Cluster.DeepCopy())
+	cluster := s.Current.Cluster.DeepCopy()
+	cluster.ResourceVersion = modifiedResourceVersion
+	return clientutil.WaitForCacheToBeUpToDate(ctx, r.Client, "Cluster update", cluster)
 }
 
 // reconcileMachineDeployments reconciles the desired state of the MachineDeployment objects.
@@ -693,7 +681,7 @@ func (r *Reconciler) createMachineDeployment(ctx context.Context, s *scope.Scope
 		bootstrapCleanupFunc()
 		return createErrorWithoutObjectName(ctx, err, md.Object)
 	}
-	if err := helper.Patch(ctx); err != nil {
+	if _, err := helper.Patch(ctx); err != nil {
 		// Best effort cleanup of the InfrastructureMachineTemplate & BootstrapTemplate (only on creation).
 		infrastructureMachineCleanupFunc()
 		bootstrapCleanupFunc()
@@ -808,13 +796,15 @@ func (r *Reconciler) updateMachineDeployment(ctx context.Context, s *scope.Scope
 		return nil
 	}
 
-	changes := patchHelper.Changes()
-	if len(changes) == 0 {
+	diff := patchHelper.Diff()
+	patchData := patchHelper.PatchData()
+	if diff == "" && patchData == "" {
 		log.Info("Patching MachineDeployment")
 	} else {
-		log.Info("Patching MachineDeployment", "diff", string(changes))
+		log.Info("Patching MachineDeployment", "diff", diff, "patch", patchData)
 	}
-	if err := patchHelper.Patch(ctx); err != nil {
+	modifiedResourceVersion, err := patchHelper.Patch(ctx)
+	if err != nil {
 		// Best effort cleanup of the InfrastructureMachineTemplate & BootstrapTemplate (only on template rotation).
 		infrastructureMachineCleanupFunc()
 		bootstrapCleanupFunc()
@@ -825,10 +815,10 @@ func (r *Reconciler) updateMachineDeployment(ctx context.Context, s *scope.Scope
 	// Wait until MachineDeployment is updated in the cache.
 	// Note: We have to do this because otherwise using a cached client in current state could
 	// return a stale state of a MachineDeployment we just patched (because the cache might be stale).
-	// Note: It is good enough to check that the resource version changed. Other controllers might have updated the
-	// MachineDeployment as well, but the combination of the patch call above without a conflict and a changed resource
-	// version here guarantees that we see the changes of our own update.
-	if err := clientutil.WaitForCacheToBeUpToDate(ctx, r.Client, "MachineDeployment update", currentMD.Object); err != nil {
+	// Note: Using DeepCopy to not modify currentMD.Object as it's not trivial to figure out what impact that would have.
+	md := currentMD.Object.DeepCopy()
+	md.ResourceVersion = modifiedResourceVersion
+	if err := clientutil.WaitForCacheToBeUpToDate(ctx, r.Client, "MachineDeployment update", md); err != nil {
 		return err
 	}
 
@@ -1016,7 +1006,7 @@ func (r *Reconciler) createMachinePool(ctx context.Context, s *scope.Scope, mp *
 		bootstrapCleanupFunc()
 		return createErrorWithoutObjectName(ctx, err, mp.Object)
 	}
-	if err := helper.Patch(ctx); err != nil {
+	if _, err := helper.Patch(ctx); err != nil {
 		// Best effort cleanup of the InfrastructureMachinePool & BootstrapConfig (only on creation).
 		infrastructureMachineMachinePoolCleanupFunc()
 		bootstrapCleanupFunc()
@@ -1071,13 +1061,15 @@ func (r *Reconciler) updateMachinePool(ctx context.Context, s *scope.Scope, mpTo
 		return nil
 	}
 
-	changes := patchHelper.Changes()
-	if len(changes) == 0 {
+	diff := patchHelper.Diff()
+	patchData := patchHelper.PatchData()
+	if diff == "" && patchData == "" {
 		log.Info("Patching MachinePool")
 	} else {
-		log.Info("Patching MachinePool", "diff", string(changes))
+		log.Info("Patching MachinePool", "diff", diff, "patch", patchData)
 	}
-	if err := patchHelper.Patch(ctx); err != nil {
+	modifiedResourceVersion, err := patchHelper.Patch(ctx)
+	if err != nil {
 		return errors.Wrapf(err, "failed to patch MachinePool %s", klog.KObj(currentMP.Object))
 	}
 	r.recorder.Eventf(cluster, corev1.EventTypeNormal, updateEventReason, "Updated MachinePool %q%s", klog.KObj(currentMP.Object), logMachinePoolVersionChange(currentMP.Object, desiredMP.Object))
@@ -1088,7 +1080,9 @@ func (r *Reconciler) updateMachinePool(ctx context.Context, s *scope.Scope, mpTo
 	// Note: It is good enough to check that the resource version changed. Other controllers might have updated the
 	// MachinePool as well, but the combination of the patch call above without a conflict and a changed resource
 	// version here guarantees that we see the changes of our own update.
-	if err := clientutil.WaitForCacheToBeUpToDate(ctx, r.Client, "MachinePool update", currentMP.Object); err != nil {
+	mp := currentMP.Object.DeepCopy()
+	mp.ResourceVersion = modifiedResourceVersion
+	if err := clientutil.WaitForCacheToBeUpToDate(ctx, r.Client, "MachinePool update", mp); err != nil {
 		return err
 	}
 
@@ -1193,7 +1187,7 @@ func (r *Reconciler) reconcileReferencedObject(ctx context.Context, in reconcile
 		if err != nil {
 			return false, errors.Wrap(createErrorWithoutObjectName(ctx, err, in.desired), "failed to create patch helper")
 		}
-		if err := helper.Patch(ctx); err != nil {
+		if _, err := helper.Patch(ctx); err != nil {
 			return false, createErrorWithoutObjectName(ctx, err, in.desired)
 		}
 		r.recorder.Eventf(in.cluster, corev1.EventTypeNormal, createEventReason, "Created %s %q", in.desired.GetKind(), klog.KObj(in.desired))
@@ -1218,13 +1212,14 @@ func (r *Reconciler) reconcileReferencedObject(ctx context.Context, in reconcile
 		return false, nil
 	}
 
-	changes := patchHelper.Changes()
-	if len(changes) == 0 {
+	diff := patchHelper.Diff()
+	patchData := patchHelper.PatchData()
+	if diff == "" && patchData == "" {
 		log.Info(fmt.Sprintf("Patching %s", in.desired.GetKind()))
 	} else {
-		log.Info(fmt.Sprintf("Patching %s", in.desired.GetKind()), "diff", string(changes))
+		log.Info(fmt.Sprintf("Patching %s", in.desired.GetKind()), "diff", diff, "patch", patchData)
 	}
-	if err := patchHelper.Patch(ctx); err != nil {
+	if _, err := patchHelper.Patch(ctx); err != nil {
 		return false, errors.Wrapf(err, "failed to patch %s %s", in.current.GetKind(), klog.KObj(in.current))
 	}
 	r.recorder.Eventf(in.cluster, corev1.EventTypeNormal, updateEventReason, "Updated %s %q%s", in.desired.GetKind(), klog.KObj(in.desired), logUnstructuredVersionChange(in.current, in.desired, in.versionGetter))
@@ -1279,7 +1274,7 @@ func (r *Reconciler) reconcileReferencedTemplate(ctx context.Context, in reconci
 		if err != nil {
 			return false, errors.Wrap(createErrorWithoutObjectName(ctx, err, in.desired), "failed to create patch helper")
 		}
-		if err := helper.Patch(ctx); err != nil {
+		if _, err := helper.Patch(ctx); err != nil {
 			return false, createErrorWithoutObjectName(ctx, err, in.desired)
 		}
 		r.recorder.Eventf(in.cluster, corev1.EventTypeNormal, createEventReason, "Created %s %q", in.desired.GetKind(), klog.KObj(in.desired))
@@ -1313,13 +1308,14 @@ func (r *Reconciler) reconcileReferencedTemplate(ctx context.Context, in reconci
 	// If there are no changes in the spec, and thus only changes in metadata, instead of doing a full template
 	// rotation we patch the object in place. This avoids recreating machines.
 	if !patchHelper.HasSpecChanges() {
-		changes := patchHelper.Changes()
-		if len(changes) == 0 {
+		diff := patchHelper.Diff()
+		patchData := patchHelper.PatchData()
+		if diff == "" && patchData == "" {
 			log.Info(fmt.Sprintf("Patching %s", in.desired.GetKind()))
 		} else {
-			log.Info(fmt.Sprintf("Patching %s", in.desired.GetKind()), "diff", string(changes))
+			log.Info(fmt.Sprintf("Patching %s", in.desired.GetKind()), "diff", diff, "patch", patchData)
 		}
-		if err := patchHelper.Patch(ctx); err != nil {
+		if _, err := patchHelper.Patch(ctx); err != nil {
 			return false, errors.Wrapf(err, "failed to patch %s %s", in.desired.GetKind(), klog.KObj(in.desired))
 		}
 		r.recorder.Eventf(in.cluster, corev1.EventTypeNormal, updateEventReason, "Updated %s %q (metadata changes)", in.desired.GetKind(), klog.KObj(in.desired))
@@ -1333,18 +1329,19 @@ func (r *Reconciler) reconcileReferencedTemplate(ctx context.Context, in reconci
 	newName := names.SimpleNameGenerator.GenerateName(in.templateNamePrefix)
 	in.desired.SetName(newName)
 
-	changes := patchHelper.Changes()
-	if len(changes) == 0 {
+	diff := patchHelper.Diff()
+	patchData := patchHelper.PatchData()
+	if diff == "" && patchData == "" {
 		log.Info(fmt.Sprintf("Rotating %s, new name %s", in.current.GetKind(), newName))
 	} else {
-		log.Info(fmt.Sprintf("Rotating %s, new name %s", in.current.GetKind(), newName), "diff", string(changes))
+		log.Info(fmt.Sprintf("Rotating %s, new name %s", in.current.GetKind(), newName), "diff", diff, "patch", patchData)
 	}
 	log.Info(fmt.Sprintf("Creating %s", in.current.GetKind()))
 	helper, err := structuredmerge.NewServerSidePatchHelper(ctx, nil, in.desired, r.Client, r.ssaCache)
 	if err != nil {
 		return false, errors.Wrap(createErrorWithoutObjectName(ctx, err, in.desired), "failed to create patch helper")
 	}
-	if err := helper.Patch(ctx); err != nil {
+	if _, err := helper.Patch(ctx); err != nil {
 		return false, createErrorWithoutObjectName(ctx, err, in.desired)
 	}
 	r.recorder.Eventf(in.cluster, corev1.EventTypeNormal, createEventReason, "Created %s %q as a replacement for %q (template rotation)", in.desired.GetKind(), klog.KObj(in.desired), in.ref.Name)

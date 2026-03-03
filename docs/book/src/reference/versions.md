@@ -67,9 +67,10 @@ The table below documents support matrix for Cluster API versions (versions olde
 
 | Minor Release | Status                  | Supported Until (including maintenance mode)                                                |
 |---------------|-------------------------|---------------------------------------------------------------------------------------------|
+| v1.13.x       | Standard support period | in maintenance mode when v1.15.0 will be released, EOL when v1.16.0 will be released        |
 | v1.12.x       | Standard support period | in maintenance mode when v1.14.0 will be released, EOL when v1.15.0 will be released        |
-| v1.11.x       | Standard support period | in maintenance mode when v1.13.0 will be released, EOL when v1.14.0 will be released        |
-| v1.10.x       | Maintenance mode        | Maintenance mode since 2025-12-18 - v1.12.0 release date, EOL when v1.13.0 will be released  |
+| v1.11.x       | Maintenance mode        | Maintenance mode since 2026-04-21 - v1.13.0 release date, EOL when v1.14.0 will be released |
+| v1.10.x       | EOL                     | EOL since 2026-04-21 - v1.13.0 release date                                                 |
 | v1.9.x        | EOL                     | EOL since 2025-12-18 - v1.12.0 release date                                                 |
 | v1.8.x        | EOL                     | EOL since 2025-08-12 - v1.11.0 release date                                                 |
 | v1.7.x        | EOL                     | EOL since 2025-04-22 - v1.10.0 release date                                                 |
@@ -159,13 +160,8 @@ Cluster API maintainers might decide to support API versions longer than what is
 |-------------|-------------|----------------------------------------------------------------------------------|
 | v1beta2     | Supported   | at least 9 months or 3 minor releases after a newer API version will be released |
 | v1beta1     | Deprecated  | Deprecated since CAPI v1.11; in v1.14, Aug 26 v1beta1 will stop to be served     |
-| v1alpha4    | Not served  | EOL since 2023-12-05 - v1.6.0 release date; removal planned for v1.13, Apr 26    |
-| v1alpha3    | Not served  | EOL since 2023-07-25 - v1.5.0 release date; removal planned for v1.13, Apr 26    |
 
 See [11920](https://github.com/kubernetes-sigs/cluster-api/issues/11920) for details about the v1beta1 removal plan.
-See [11919](https://github.com/kubernetes-sigs/cluster-api/issues/11919) for details about the v1alpha3/v1alpha4 removal plan.
-Note: Cluster API stopped to serve v1alpha3 API types from the v1.5 release and v1alpha4 types starting from the v1.6 release.
-Those types still exist in Cluster API while we work to a fix (or a workaround) for [10051](https://github.com/kubernetes-sigs/cluster-api/issues/10051).
 
 <aside class="note warning">
 
@@ -226,8 +222,6 @@ providers of an older contract version) e.g.
 |------------------|-----------------------------------|-------------|-------------------------------------------------------------------------------------------------------------------------------|
 | v1beta2          | v1beta1 (temporarily)             | Supported   | After a newer API contract will be released                                                                                   |
 | v1beta1          |                                   | Deprecated  | Deprecated since CAPI v1.11; in v1.14, Aug 26 v1beta2 will drop compatibility with v1beta1 and v1beta1 will be considered EOL |
-| v1alpha4         |                                   | EOL         | EOL since 2023-12-05 - v1.6.0 release date                                                                                    |
-| v1alpha3         |                                   | EOL         | EOL since 2023-07-25 - v1.5.0 release date                                                                                    |
 
 See [11920](https://github.com/kubernetes-sigs/cluster-api/issues/11920) for details about the v1beta1 removal plan.
 
@@ -257,15 +251,28 @@ Each Cluster API minor release supports (when it's initially created):
 * Four Kubernetes minor releases for the management cluster (N - N-3)
 * Six Kubernetes minor releases for the workload cluster (N - N-5)
 
-When a new Kubernetes minor release is available, the Cluster API team will try to support it in an upcoming Cluster API
-patch release, thus extending the support matrix for the latest supported Cluster API minor release to:
-* Five Kubernetes minor releases for the management cluster (N - N-4)
-* Seven Kubernetes minor releases for the workload cluster (N - N-6)
+When a new Kubernetes minor release is available, the Cluster API team will try to support it in upcoming Cluster API
+patch releases, thus:
+* extending the support matrix for the latest supported Cluster API minor release to:
+  * Five Kubernetes minor releases for the management cluster (N - N-4)
+  * Seven Kubernetes minor releases for the workload cluster (N - N-6)
+* extending the support matrix for the Cluster API minor release before that to: (this will be only done for Kubernetes >= v1.36)
+  * Six Kubernetes minor releases for the management cluster (N - N-5)
+  * Eight Kubernetes minor releases for the workload cluster (N - N-7)
 
-For example, Cluster API v1.7.0 would support the following Kubernetes versions:
-* v1.26.x to v1.29.x for the management cluster
-* v1.24.x to v1.29.x for the workload cluster
-* When Kubernetes 1.30 is released, it will be supported in v1.7.x (but not in v1.6.x)
+Please note that we will *try* to support the new Kubernetes release, there is no guarantee 
+that we will be able to backport the required changes as they might be breaking.
+
+Example:
+* When Cluster API v1.7.0 is released it will support:
+  * v1.26.x to v1.29.x for the management cluster
+  * v1.24.x to v1.29.x for the workload cluster
+* When Kubernetes 1.30 is released: v1.7.x will support:
+  * v1.26.x to v1.30.x for the management cluster
+  * v1.24.x to v1.30.x for the workload cluster
+* When Kubernetes 1.31 is released: v1.7.x will support:
+  * v1.26.x to v1.31.x for the management cluster
+  * v1.24.x to v1.31.x for the workload cluster
 
 <aside class="note warning">
 
@@ -306,17 +313,16 @@ In some cases, also Cluster API and/or Cluster API providers are defining additi
 The following table defines the support matrix for the Cluster API core provider.
 See [Cluster API release support](#cluster-api-release-support) and [Kubernetes versions support](#kubernetes-versions-support).
 
-|                  |v1.10, _Maintenance Mode_ | v1.11             | v1.12                        |
-|------------------|--------------------------|-------------------|------------------------------|
-| Kubernetes v1.27 | ✓ (only workload)        |                   |                              |
-| Kubernetes v1.28 | ✓ (only workload)        | ✓ (only workload) |                              |
-| Kubernetes v1.29 | ✓                        | ✓ (only workload) | ✓ (only workload)            |
-| Kubernetes v1.30 | ✓                        | ✓                 | ✓ (only workload)            |
-| Kubernetes v1.31 | ✓                        | ✓                 | ✓                            |
-| Kubernetes v1.32 | ✓                        | ✓                 | ✓                            |
-| Kubernetes v1.33 | ✓ >= v1.10.1             | ✓                 | ✓                            |
-| Kubernetes v1.34 |                          | ✓ >= v1.11.1      | ✓                            | 
-| Kubernetes v1.35 |                          |                   | ✓ >= v1.12.1                 |
+|                  |v1.11, _Maintenance Mode_ | v1.12                | v1.13               |
+|------------------|--------------------------|----------------------|---------------------|
+| Kubernetes v1.28 | ✓ (only workload)        |                      |                     |
+| Kubernetes v1.29 | ✓ (only workload)        | ✓ (only workload)   |                      |
+| Kubernetes v1.30 | ✓                        | ✓ (only workload)   |  ✓ (only workload)   |
+| Kubernetes v1.31 | ✓                        | ✓                   |  ✓ (only workload)  |
+| Kubernetes v1.32 | ✓                        | ✓                   |  ✓                   |
+| Kubernetes v1.33 | ✓                        | ✓                   |  ✓                   |
+| Kubernetes v1.34 | ✓ >= v1.11.1             | ✓                   |  ✓                   |
+| Kubernetes v1.35 |                          | ✓ >= v1.12.1        |  ✓                   |
 
 
 See also [Kubernetes version specific notes](#kubernetes-version-specific-notes).
@@ -403,7 +409,9 @@ Notably, the Max CoreDNS version could change also with patch releases.
 | v1.11       | v1.12.3             |
 | v1.11.2     | v1.12.4             |
 | >= v1.11.3  | v1.13.1             |
+| >= v1.11.6  | v1.14.1             |
 | v1.12       | v1.13.1             |
+| >= v1.12.3  | v1.14.1             |
 
 See [corefile-migration](https://github.com/coredns/corefile-migration)
 
@@ -450,6 +458,11 @@ for the Management clusters.
 
 ### Kubernetes version specific notes
 
+**1.36**:
+
+* Kubeadm Bootstrap provider:
+  * The `ControlPlaneKubeletLocalMode` feature gate graduated to GA and has been removed in Kubernetes v1.36. CAPI will no longer set this feature gate explicitly for Kubernetes 1.36+. For Kubernetes versions 1.31-1.35, CAPI continues to set it automatically to ensure kubelet continues working during control plane upgrades.
+
 **1.31**:
 
 * All providers:
@@ -460,10 +473,3 @@ for the Management clusters.
 
 **1.29**:
 * In-tree cloud providers are now switched off by default. Please use DisableCloudProviders and DisableKubeletCloudCredentialProvider feature flags if you still need this functionality. (https://github.com/kubernetes/kubernetes/pull/117503)
-
-**1.24**:
-* Kubeadm Bootstrap provider:
-  * `kubeadm` now sets both the `node-role.kubernetes.io/control-plane` and `node-role.kubernetes.io/master` taints on control plane nodes.
-  * `kubeadm` now only sets the `node-role.kubernetes.io/control-plane` label on control plane nodes (the `node-role.kubernetes.io/master` label is not set anymore).
-* Kubeadm Bootstrap provider and Kubeadm Control Plane provider
-  * `criSocket` without a scheme prefix has been deprecated in the kubelet since a while. `kubeadm` now shows a warning if no scheme is present and eventually the support for `criSocket`'s without prefix will be dropped. Please adjust the `criSocket` accordingly (e.g. `unix:///var/run/containerd/containerd.sock`) if you are configuring the `criSocket` in CABPK or KCP resources.

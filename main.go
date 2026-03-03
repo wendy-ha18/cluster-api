@@ -49,6 +49,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -72,10 +73,6 @@ import (
 	runtimecatalog "sigs.k8s.io/cluster-api/exp/runtime/catalog"
 	runtimeclient "sigs.k8s.io/cluster-api/exp/runtime/client"
 	"sigs.k8s.io/cluster-api/feature"
-	addonsv1alpha3 "sigs.k8s.io/cluster-api/internal/api/addons/v1alpha3"
-	addonsv1alpha4 "sigs.k8s.io/cluster-api/internal/api/addons/v1alpha4"
-	clusterv1alpha3 "sigs.k8s.io/cluster-api/internal/api/core/v1alpha3"
-	clusterv1alpha4 "sigs.k8s.io/cluster-api/internal/api/core/v1alpha4"
 	"sigs.k8s.io/cluster-api/internal/contract"
 	internalruntimeclient "sigs.k8s.io/cluster-api/internal/runtime/client"
 	runtimeregistry "sigs.k8s.io/cluster-api/internal/runtime/registry"
@@ -139,13 +136,9 @@ func init() {
 	_ = apiextensionsv1.AddToScheme(scheme)
 	_ = storagev1.AddToScheme(scheme)
 
-	_ = clusterv1alpha3.AddToScheme(scheme)
-	_ = clusterv1alpha4.AddToScheme(scheme)
 	_ = clusterv1beta1.AddToScheme(scheme)
 	_ = clusterv1.AddToScheme(scheme)
 
-	_ = addonsv1alpha3.AddToScheme(scheme)
-	_ = addonsv1alpha4.AddToScheme(scheme)
 	_ = addonsv1beta1.AddToScheme(scheme)
 	_ = addonsv1.AddToScheme(scheme)
 
@@ -242,10 +235,10 @@ func InitFlags(fs *pflag.FlagSet) {
 	fs.DurationVar(&syncPeriod, "sync-period", 10*time.Minute,
 		"The minimum interval at which watched resources are reconciled (e.g. 15m)")
 
-	fs.Float32Var(&restConfigQPS, "kube-api-qps", 20,
+	fs.Float32Var(&restConfigQPS, "kube-api-qps", 100,
 		"Maximum queries per second from the controller client to the Kubernetes API server.")
 
-	fs.IntVar(&restConfigBurst, "kube-api-burst", 30,
+	fs.IntVar(&restConfigBurst, "kube-api-burst", 200,
 		"Maximum number of queries that should be allowed in one burst from the controller client to the Kubernetes API server.")
 
 	fs.Float32Var(&clusterCacheClientQPS, "clustercache-client-qps", 20,
@@ -539,13 +532,25 @@ func setupReconcilers(ctx context.Context, mgr ctrl.Manager, watchNamespaces map
 	var runtimeClient runtimeclient.Client
 	if feature.Gates.Enabled(feature.RuntimeSDK) {
 		// This is the creation of the runtimeClient for the controllers, embedding a shared catalog and registry instance.
-		runtimeClient = internalruntimeclient.New(internalruntimeclient.Options{
+		var certWatcher *certwatcher.CertWatcher
+		runtimeClient, certWatcher, err = internalruntimeclient.New(internalruntimeclient.Options{
 			CertFile: runtimeExtensionCertFile,
 			KeyFile:  runtimeExtensionKeyFile,
 			Catalog:  catalog,
 			Registry: runtimeregistry.New(),
 			Client:   mgr.GetClient(),
 		})
+		if err != nil {
+			setupLog.Error(err, "Unable to create RuntimeSDK client")
+			os.Exit(1)
+		}
+		if certWatcher != nil {
+			// Note: certWatcher is managed by the manager to ensure that a certWatcher failure leads to a binary restart.
+			if err := mgr.Add(certWatcher); err != nil {
+				setupLog.Error(err, "Unable to add RuntimeSDK client cert-watcher to the manager")
+				os.Exit(1)
+			}
+		}
 	}
 
 	// Setup a separate cache without label selector for secrets, to be used
@@ -765,8 +770,6 @@ func setupWebhooks(ctx context.Context, mgr ctrl.Manager, clusterCacheReader web
 	apiVersionGetter := func(gk schema.GroupKind) (string, error) {
 		return contract.GetAPIVersion(ctx, mgr.GetClient(), gk)
 	}
-	clusterv1alpha3.SetAPIVersionGetter(apiVersionGetter)
-	clusterv1alpha4.SetAPIVersionGetter(apiVersionGetter)
 	clusterv1beta1.SetAPIVersionGetter(apiVersionGetter)
 
 	// NOTE: ClusterClass and managed topologies are behind ClusterTopology feature gate flag; the webhook

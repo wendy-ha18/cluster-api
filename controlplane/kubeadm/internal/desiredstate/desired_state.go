@@ -49,6 +49,12 @@ var (
 	// the spec.clusterIP field selector that is only implemented in kube-apiserver >= 1.31.0).
 	minKubernetesVersionControlPlaneKubeletLocalMode = semver.MustParse("1.31.0")
 
+	// droppedKubernetesVersionControlPlaneKubeletLocalMode is the version from which
+	// we will drop the ControlPlaneKubeletLocalMode kubeadm feature gate.
+	// Starting with Kubernetes 1.36, this feature graduated to GA and the feature gate
+	// is no longer needed (and will be removed in future K8s versions).
+	droppedKubernetesVersionControlPlaneKubeletLocalMode = semver.MustParse("1.36.0")
+
 	// ControlPlaneKubeletLocalMode is a feature gate of kubeadm that ensures
 	// kubelets only communicate with the local apiserver.
 	ControlPlaneKubeletLocalMode = "ControlPlaneKubeletLocalMode"
@@ -166,6 +172,7 @@ func ComputeDesiredMachine(kcp *controlplanev1.KubeadmControlPlane, cluster *clu
 	desiredMachine.Spec.Deletion.NodeDrainTimeoutSeconds = kcp.Spec.MachineTemplate.Spec.Deletion.NodeDrainTimeoutSeconds
 	desiredMachine.Spec.Deletion.NodeDeletionTimeoutSeconds = kcp.Spec.MachineTemplate.Spec.Deletion.NodeDeletionTimeoutSeconds
 	desiredMachine.Spec.Deletion.NodeVolumeDetachTimeoutSeconds = kcp.Spec.MachineTemplate.Spec.Deletion.NodeVolumeDetachTimeoutSeconds
+	desiredMachine.Spec.Taints = kcp.Spec.MachineTemplate.Spec.Taints
 
 	// Note: We intentionally don't set "minReadySeconds" on Machines because we consider it enough to have machine availability driven by readiness of control plane components.
 	if existingMachine != nil {
@@ -212,8 +219,13 @@ func ComputeDesiredKubeadmConfig(kcp *controlplanev1.KubeadmControlPlane, cluste
 	if isJoin {
 		// Note: When building a KubeadmConfig for a joining CP machine empty out the unnecessary InitConfiguration.
 		spec.InitConfiguration = bootstrapv1.InitConfiguration{}
-		// NOTE: For the joining we are preserving the ClusterConfiguration in order to determine if the
+		// Note: For the joining we are preserving the ClusterConfiguration in order to determine if the
 		// cluster is using an external etcd in the kubeadm bootstrap provider (even if this is not required by kubeadm Join).
+		// Note: We are always setting JoinConfiguration.ControlPlane so we can later identify this KubeadmConfig as a
+		// join KubeadmConfig.
+		if spec.JoinConfiguration.ControlPlane == nil {
+			spec.JoinConfiguration.ControlPlane = &bootstrapv1.JoinControlPlane{}
+		}
 	} else {
 		// Note: When building a KubeadmConfig for the first CP machine empty out the unnecessary JoinConfiguration.
 		spec.JoinConfiguration = bootstrapv1.JoinConfiguration{}
@@ -236,6 +248,7 @@ func ComputeDesiredKubeadmConfig(kcp *controlplanev1.KubeadmControlPlane, cluste
 		Spec: *spec,
 	}
 	if existingKubeadmConfig != nil {
+		kubeadmConfig.SetName(existingKubeadmConfig.GetName())
 		kubeadmConfig.SetUID(existingKubeadmConfig.GetUID())
 	}
 	return kubeadmConfig, nil
@@ -284,6 +297,7 @@ func ComputeDesiredInfraMachine(ctx context.Context, c client.Client, kcp *contr
 		return nil, errors.Wrap(err, "failed to compute desired InfraMachine")
 	}
 	if existingInfraMachine != nil {
+		infraMachine.SetName(existingInfraMachine.GetName())
 		infraMachine.SetUID(existingInfraMachine.GetUID())
 	}
 	return infraMachine, nil
@@ -291,7 +305,13 @@ func ComputeDesiredInfraMachine(ctx context.Context, c client.Client, kcp *contr
 
 // DefaultFeatureGates defaults the feature gates field.
 func DefaultFeatureGates(kubeadmConfigSpec *bootstrapv1.KubeadmConfigSpec, kubernetesVersion semver.Version) {
+	// Only set ControlPlaneKubeletLocalMode for Kubernetes versions 1.31 <= version < 1.36
+	// For K8s < 1.31: feature gate doesn't exist
+	// For K8s >= 1.36: feature graduated to GA and gate does not exist anymore
 	if version.Compare(kubernetesVersion, minKubernetesVersionControlPlaneKubeletLocalMode, version.WithoutPreReleases()) < 0 {
+		return
+	}
+	if version.Compare(kubernetesVersion, droppedKubernetesVersionControlPlaneKubeletLocalMode, version.WithoutPreReleases()) >= 0 {
 		return
 	}
 

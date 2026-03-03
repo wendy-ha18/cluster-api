@@ -34,7 +34,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	"sigs.k8s.io/cluster-api/controllers/clustercache"
@@ -52,7 +51,6 @@ import (
 	"sigs.k8s.io/cluster-api/internal/topology/selectors"
 	"sigs.k8s.io/cluster-api/internal/webhooks"
 	"sigs.k8s.io/cluster-api/util"
-	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/cluster-api/util/cache"
 	"sigs.k8s.io/cluster-api/util/conversion"
 )
@@ -735,15 +733,21 @@ func computeCluster(_ context.Context, s *scope.Scope, infrastructureCluster, co
 	// NOTE, it is required to surface intermediate steps of the upgrade plan to allow creation of machines in KCP/MS.
 	// TODO: consider if we want to surface the upgrade plan (or the list of desired versions) in cluster status;
 	//   TBD if the semantic of the new field can replace this annotation.
+	if cluster.Annotations == nil {
+		cluster.Annotations = map[string]string{}
+	}
 	if hooks.IsPending(runtimehooksv1.AfterClusterUpgrade, s.Current.Cluster) {
 		// NOTE: to detect if we are at the beginning of an upgrade, we check if the intent to call the AfterClusterUpgrade is already tracked.
 		controlPlaneVersion, err := contract.ControlPlane().Version().Get(controlPlane)
 		if err != nil {
 			return nil, errors.Wrap(err, "error getting control plane version")
 		}
-		annotations.AddAnnotations(cluster, map[string]string{clusterv1.ClusterTopologyUpgradeStepAnnotation: *controlPlaneVersion})
+		cluster.Annotations[clusterv1.ClusterTopologyUpgradeStepAnnotation] = *controlPlaneVersion
 	} else {
-		delete(cluster.Annotations, clusterv1.ClusterTopologyUpgradeStepAnnotation)
+		// Note: Setting the annotation to "" instead of deleting it because we cannot be sure
+		// that we are able to remove the annotation from the Cluster with SSA if we lost ownership of
+		// the annotation in managedFields e.g. because of: https://github.com/kubernetes/kubernetes/issues/136919.
+		cluster.Annotations[clusterv1.ClusterTopologyUpgradeStepAnnotation] = ""
 	}
 
 	return cluster, nil
@@ -1665,23 +1669,9 @@ func getOwnerReferenceFrom(obj, owner client.Object) *metav1.OwnerReference {
 	return nil
 }
 
-func cleanupV1Beta1Cluster(cluster *clusterv1beta1.Cluster) *clusterv1beta1.Cluster {
-	// Optimize size of Cluster by not sending status, the managedFields and some specific annotations.
-	cluster.SetManagedFields(nil)
-
-	// The conversion that we run before calling cleanupCluster does not clone annotations
-	// So we have to do it here to not modify the original Cluster.
-	if cluster.Annotations != nil {
-		annotations := maps.Clone(cluster.Annotations)
-		delete(annotations, corev1.LastAppliedConfigAnnotation)
-		delete(annotations, conversion.DataAnnotation)
-		cluster.Annotations = annotations
-	}
-	cluster.Status = clusterv1beta1.ClusterStatus{}
-	return cluster
-}
-
 func cleanupCluster(cluster *clusterv1.Cluster) *clusterv1.Cluster {
+	cluster = cluster.DeepCopy()
+
 	// Optimize size of Cluster by not sending status, the managedFields and some specific annotations.
 	cluster.SetManagedFields(nil)
 

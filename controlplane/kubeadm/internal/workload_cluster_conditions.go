@@ -130,6 +130,7 @@ func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane
 	currentMembers, alarms, err := w.getCurrentEtcdMembersAndAlarms(ctx, machinesNotProvisioningOrDeleting, controlPlaneNodes)
 	if err == nil {
 		controlPlane.EtcdMembers = currentMembers
+		controlPlane.EtcdMembersAlarms = alarms
 
 		for _, machine := range machinesNotProvisioningOrDeleting {
 			// Retrieve the member hosted on the machine.
@@ -142,7 +143,7 @@ func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane
 					Type:    controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyCondition,
 					Status:  metav1.ConditionFalse,
 					Reason:  controlplanev1.KubeadmControlPlaneMachineEtcdMemberNotHealthyReason,
-					Message: fmt.Sprintf("Etcd reports the cluster is composed by %s, but the etcd member hosted on this Machine is not included", etcdutil.MemberNames(currentMembers)),
+					Message: fmt.Sprintf("Etcd reports the cluster is composed by %s, but the etcd member hosted on Machine %s (%s) is not included", etcdutil.MemberNames(currentMembers), machine.Name, machine.Status.NodeRef.Name),
 				})
 				continue
 			}
@@ -580,6 +581,19 @@ func (w *Workload) UpdateStaticPodConditions(ctx context.Context, controlPlane *
 			continue
 		}
 
+		// If the default control plane taint is missing, set all conditions to unknown.
+		if controlPlane.DefaultTaintIsMissing(machine, &node) {
+			for _, condition := range allMachinePodConditions {
+				conditions.Set(machine, metav1.Condition{
+					Type:    condition,
+					Status:  metav1.ConditionUnknown,
+					Reason:  controlplanev1.KubeadmControlPlaneMachinePodInspectionFailedReason,
+					Message: fmt.Sprintf("Node %s does not have the %s:%s taint", machine.Status.NodeRef.Name, labelNodeRoleControlPlane, corev1.TaintEffectNoSchedule),
+				})
+			}
+			continue
+		}
+
 		// If the node is Unreachable, information about static pods could be stale so set all conditions to unknown.
 		if nodeHasUnreachableTaint(node) {
 			// NOTE: We are assuming unreachable as a temporary condition, leaving to MHC
@@ -622,11 +636,32 @@ func (w *Workload) UpdateStaticPodConditions(ctx context.Context, controlPlane *
 			}
 		}
 		if !found {
+			// tries to get the node by name, so we can detect when a node is missing or when a node exists, but it does not have the required CP label.
+			nodeWithoutLabelExist := false
+			n := &corev1.Node{}
+			if err := w.Client.Get(ctx, ctrlclient.ObjectKey{Name: machine.Status.NodeRef.Name}, n); err == nil {
+				nodeWithoutLabelExist = true
+			}
+
 			for _, condition := range allMachinePodV1Beta1Conditions {
 				v1beta1conditions.MarkFalse(machine, condition, controlplanev1.PodFailedV1Beta1Reason, clusterv1.ConditionSeverityError, "Missing Node")
 			}
 
 			for _, condition := range allMachinePodConditions {
+				if nodeWithoutLabelExist {
+					msg := fmt.Sprintf("Node %s does not have the %s label", machine.Status.NodeRef.Name, labelNodeRoleControlPlane)
+					if controlPlane.DefaultTaintIsMissing(machine, n) {
+						msg += fmt.Sprintf(" and the %s:%s taint", labelNodeRoleControlPlane, corev1.TaintEffectNoSchedule)
+					}
+					conditions.Set(machine, metav1.Condition{
+						Type:    condition,
+						Status:  metav1.ConditionUnknown,
+						Reason:  controlplanev1.KubeadmControlPlaneMachinePodInspectionFailedReason,
+						Message: msg,
+					})
+					continue
+				}
+
 				conditions.Set(machine, metav1.Condition{
 					Type:    condition,
 					Status:  metav1.ConditionUnknown,

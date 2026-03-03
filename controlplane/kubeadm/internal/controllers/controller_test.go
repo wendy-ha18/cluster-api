@@ -55,6 +55,7 @@ import (
 	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/controlplane/kubeadm/internal"
 	"sigs.k8s.io/cluster-api/controlplane/kubeadm/internal/desiredstate"
+	"sigs.k8s.io/cluster-api/controlplane/kubeadm/internal/etcd"
 	controlplanev1webhooks "sigs.k8s.io/cluster-api/controlplane/kubeadm/internal/webhooks"
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/internal/util/ssa"
@@ -488,7 +489,7 @@ func TestReconcileClusterNoEndpoints(t *testing.T) {
 	result, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: util.ObjectKey(kcp)})
 	g.Expect(err).ToNot(HaveOccurred())
 	// TODO: this should stop to re-queue as soon as we have a proper remote cluster cache in place.
-	g.Expect(result).To(BeComparableTo(ctrl.Result{Requeue: false, RequeueAfter: 20 * time.Second}))
+	g.Expect(result.RequeueAfter).To(Equal(20 * time.Second))
 	g.Expect(r.Client.Get(ctx, util.ObjectKey(kcp), kcp)).To(Succeed())
 
 	// Always expect that the Finalizer is set on the passed in resource
@@ -1529,7 +1530,7 @@ func TestReconcileInitializeControlPlane_withUserCA(t *testing.T) {
 			KubeadmConfigSpec: bootstrapv1.KubeadmConfigSpec{},
 		},
 	}
-	g.Expect(env.Create(ctx, kcp)).To(Succeed())
+	g.Expect(env.CreateAndWait(ctx, kcp)).To(Succeed())
 
 	corednsCM := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1661,6 +1662,121 @@ kubernetesVersion: metav1.16.1`,
 		g.Expect(infraObj.GetAnnotations()).To(HaveKeyWithValue(clusterv1.TemplateClonedFromNameAnnotation, genericInfrastructureMachineTemplate.GetName()))
 		g.Expect(infraObj.GetAnnotations()).To(HaveKeyWithValue(clusterv1.TemplateClonedFromGroupKindAnnotation, genericInfrastructureMachineTemplate.GroupVersionKind().GroupKind().String()))
 	}, 30*time.Second).Should(Succeed())
+}
+
+func TestReconcileClusterCertificates(t *testing.T) {
+	cluster, kcp, tmpl := createClusterWithControlPlane(metav1.NamespaceDefault)
+	cluster.Spec.ControlPlaneEndpoint.Host = "bar"
+	cluster.Spec.ControlPlaneEndpoint.Port = 6443
+	kcp.Spec.Version = "v1.31.0"
+
+	controlPlane := &internal.ControlPlane{
+		KCP:     kcp,
+		Cluster: cluster,
+	}
+
+	fakeClient := newFakeClient(cluster, kcp, tmpl)
+	r := KubeadmControlPlaneReconciler{
+		Client:              fakeClient,
+		SecretCachingClient: fakeClient,
+	}
+
+	assertCertificates := func(g *WithT) {
+		certificates := secret.Certificates{
+			{Purpose: secret.ClusterCA},
+			{Purpose: secret.FrontProxyCA},
+			{Purpose: secret.ServiceAccount},
+			{Purpose: secret.EtcdCA},
+		}
+		for _, c := range certificates {
+			s := &corev1.Secret{}
+			// Set the secret name to the purpose
+			s.Name = secret.Name(cluster.Name, c.Purpose)
+			g.Expect(fakeClient.Get(ctx, client.ObjectKey{
+				Namespace: cluster.Namespace,
+				Name:      s.Name,
+			}, s)).To(Succeed())
+			g.Expect(s.Type).To(Equal(clusterv1.ClusterSecretType))
+			g.Expect(s.OwnerReferences).To(HaveLen(1))
+			g.Expect(s.OwnerReferences[0]).To(Equal(metav1.OwnerReference{
+				APIVersion:         controlplanev1.GroupVersion.String(),
+				Kind:               "KubeadmControlPlane",
+				Name:               kcp.Name,
+				UID:                kcp.UID,
+				Controller:         ptr.To(true),
+				BlockOwnerDeletion: ptr.To(true),
+			}))
+		}
+	}
+
+	t.Run("creates certificates if missing", func(*testing.T) {
+		g := NewWithT(t)
+
+		err := r.reconcileClusterCertificates(ctx, controlPlane)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(ptr.Deref(conditions.Get(controlPlane.KCP, controlplanev1.KubeadmControlPlaneCertificatesAvailableCondition), metav1.Condition{})).To(conditions.MatchCondition(metav1.Condition{
+			Type:   controlplanev1.KubeadmControlPlaneCertificatesAvailableCondition,
+			Status: metav1.ConditionTrue,
+			Reason: controlplanev1.KubeadmControlPlaneCertificatesAvailableReason,
+		}, conditions.IgnoreLastTransitionTime(true)))
+
+		assertCertificates(g)
+	})
+
+	t.Run("no-op if certificates exist", func(*testing.T) {
+		g := NewWithT(t)
+
+		err := r.reconcileClusterCertificates(ctx, controlPlane)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(ptr.Deref(conditions.Get(controlPlane.KCP, controlplanev1.KubeadmControlPlaneCertificatesAvailableCondition), metav1.Condition{})).To(conditions.MatchCondition(metav1.Condition{
+			Type:   controlplanev1.KubeadmControlPlaneCertificatesAvailableCondition,
+			Status: metav1.ConditionTrue,
+			Reason: controlplanev1.KubeadmControlPlaneCertificatesAvailableReason,
+		}, conditions.IgnoreLastTransitionTime(true)))
+
+		assertCertificates(g)
+	})
+
+	t.Run("no-op after control plane is initialized", func(*testing.T) {
+		g := NewWithT(t)
+
+		kcpBefore := controlPlane.KCP.DeepCopy()
+		conditions.Set(controlPlane.KCP, metav1.Condition{
+			Type:   controlplanev1.KubeadmControlPlaneInitializedCondition,
+			Status: metav1.ConditionTrue,
+			Reason: controlplanev1.KubeadmControlPlaneInitializedReason,
+		})
+		g.Expect(fakeClient.Status().Patch(ctx, controlPlane.KCP, client.MergeFrom(kcpBefore))).To(Succeed())
+
+		err := r.reconcileClusterCertificates(ctx, controlPlane)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(ptr.Deref(conditions.Get(controlPlane.KCP, controlplanev1.KubeadmControlPlaneCertificatesAvailableCondition), metav1.Condition{})).To(conditions.MatchCondition(metav1.Condition{
+			Type:   controlplanev1.KubeadmControlPlaneCertificatesAvailableCondition,
+			Status: metav1.ConditionTrue,
+			Reason: controlplanev1.KubeadmControlPlaneCertificatesAvailableReason,
+		}, conditions.IgnoreLastTransitionTime(true)))
+
+		assertCertificates(g)
+	})
+
+	t.Run("should not recreate certificates if deleted after control plane is initialized", func(*testing.T) {
+		g := NewWithT(t)
+
+		s := &corev1.Secret{}
+		// Set the secret name to the purpose
+		s.Namespace = cluster.Namespace
+		s.Name = secret.Name(cluster.Name, secret.ClusterCA)
+		g.Expect(fakeClient.Delete(ctx, s)).To(Succeed())
+
+		err := r.reconcileClusterCertificates(ctx, controlPlane)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(ptr.Deref(conditions.Get(controlPlane.KCP, controlplanev1.KubeadmControlPlaneCertificatesAvailableCondition), metav1.Condition{})).To(conditions.MatchCondition(metav1.Condition{
+			Type:    controlplanev1.KubeadmControlPlaneCertificatesAvailableCondition,
+			Status:  metav1.ConditionFalse,
+			Reason:  controlplanev1.KubeadmControlPlaneCertificatesNotAvailableReason,
+			Message: "Cluster certificate for ca is not available, please check cluster certificate secrets",
+		}, conditions.IgnoreLastTransitionTime(true)))
+	})
 }
 
 func TestKubeadmControlPlaneReconciler_syncMachines(t *testing.T) {
@@ -1954,7 +2070,9 @@ func TestKubeadmControlPlaneReconciler_syncMachines(t *testing.T) {
 		SecretCachingClient: secretCachingClient,
 		ssaCache:            ssa.NewCache("test-controller"),
 	}
-	g.Expect(reconciler.syncMachines(ctx, controlPlane)).To(Succeed())
+	stopReconcile, err := reconciler.syncMachines(ctx, controlPlane)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(stopReconcile).To(BeFalse())
 
 	updatedInPlaceMutatingMachine := inPlaceMutatingMachine.DeepCopy()
 	g.Eventually(func(g Gomega) {
@@ -2030,7 +2148,9 @@ func TestKubeadmControlPlaneReconciler_syncMachines(t *testing.T) {
 	kcp.Spec.MachineTemplate.Spec.Deletion.NodeDeletionTimeoutSeconds = duration10s
 	kcp.Spec.MachineTemplate.Spec.Deletion.NodeVolumeDetachTimeoutSeconds = duration10s
 	controlPlane.KCP = kcp
-	g.Expect(reconciler.syncMachines(ctx, controlPlane)).To(Succeed())
+	stopReconcile, err = reconciler.syncMachines(ctx, controlPlane)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(stopReconcile).To(BeFalse())
 
 	// Verify in-place mutable fields are updated on the Machine.
 	updatedInPlaceMutatingMachine = inPlaceMutatingMachine.DeepCopy()
@@ -3085,6 +3205,206 @@ func (cc *fakeClusterCache) GetHealthCheckingState(_ context.Context, _ client.O
 	}
 }
 
+func TestKubeadmControlPlaneReconciler_reconcileEtcdMembers(t *testing.T) {
+	m1 := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "m1",
+			Annotations: map[string]string{
+				controlplanev1.PreTerminateHookCleanupAnnotation: "",
+			},
+		},
+		Status: clusterv1.MachineStatus{
+			NodeRef: clusterv1.MachineNodeReference{
+				Name: "m1-node",
+			},
+		},
+	}
+
+	tests := []struct {
+		name                       string
+		controlPlane               *internal.ControlPlane
+		additionalEtcdMembers      []*etcd.Member
+		wantErr                    bool
+		wantResult                 ctrl.Result
+		wantRemoveEtcdMemberCalled int
+	}{
+		{
+			name: "No op when external etcd mode",
+			controlPlane: &internal.ControlPlane{
+				KCP: &controlplanev1.KubeadmControlPlane{
+					Spec: controlplanev1.KubeadmControlPlaneSpec{
+						KubeadmConfigSpec: bootstrapv1.KubeadmConfigSpec{
+							ClusterConfiguration: bootstrapv1.ClusterConfiguration{
+								Etcd: bootstrapv1.Etcd{
+									External: bootstrapv1.ExternalEtcd{
+										Endpoints: make([]string, 0),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantResult: ctrl.Result{},
+		},
+		{
+			name: "No op when no machines",
+			controlPlane: &internal.ControlPlane{
+				KCP: &controlplanev1.KubeadmControlPlane{},
+			},
+			wantResult: ctrl.Result{},
+		},
+		{
+			name: "No op when etcdMember is empty",
+			controlPlane: &internal.ControlPlane{
+				KCP: &controlplanev1.KubeadmControlPlane{},
+				Machines: collections.Machines{
+					"machine-without-etcd-member": func() *clusterv1.Machine {
+						m := m1.DeepCopy()
+						m.Name = "machine-without-etcd-member"
+						m.Status.NodeRef.Name = ""
+						return m
+					}(),
+				},
+			},
+			wantResult: ctrl.Result{},
+		},
+		{
+			name: "No op when etcd cluster health is true",
+			controlPlane: &internal.ControlPlane{
+				KCP: &controlplanev1.KubeadmControlPlane{
+					Status: controlplanev1.KubeadmControlPlaneStatus{
+						Conditions: []metav1.Condition{
+							{Type: controlplanev1.KubeadmControlPlaneEtcdClusterHealthyCondition, Status: metav1.ConditionTrue},
+						},
+					},
+				},
+				Machines: collections.Machines{
+					m1.Name: m1,
+				},
+			},
+			wantResult: ctrl.Result{},
+		},
+		{
+			name: "No op when there is at leat one machine provisioning",
+			controlPlane: &internal.ControlPlane{
+				KCP: &controlplanev1.KubeadmControlPlane{},
+				Machines: collections.Machines{
+					m1.Name: m1,
+					"machine-provisioning": func() *clusterv1.Machine {
+						m := m1.DeepCopy()
+						m.Name = "machine-provisioning"
+						m.Status.NodeRef.Name = ""
+						return m
+					}(),
+				},
+			},
+			wantResult: ctrl.Result{},
+		},
+		{
+			name: "No op when all machines have a corresponding etcd member",
+			controlPlane: &internal.ControlPlane{
+				KCP: &controlplanev1.KubeadmControlPlane{},
+				Machines: collections.Machines{
+					m1.Name: m1,
+					"m2": func() *clusterv1.Machine {
+						m := m1.DeepCopy()
+						m.Name = "m2"
+						m.Status.NodeRef.Name = "m2-node"
+						return m
+					}(),
+				},
+			},
+			wantResult: ctrl.Result{},
+		},
+		{
+			name: "Remove additional etcd members when the target etcd cluster is healthy",
+			controlPlane: &internal.ControlPlane{
+				KCP: &controlplanev1.KubeadmControlPlane{},
+				Machines: collections.Machines{
+					m1.Name: func() *clusterv1.Machine {
+						m := m1.DeepCopy()
+						conditions.Set(m, metav1.Condition{Type: controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyReason})
+						return m
+					}(),
+				},
+			},
+			additionalEtcdMembers: []*etcd.Member{
+				{Name: "foo"},
+			},
+			wantResult:                 ctrl.Result{RequeueAfter: 1 * time.Second},
+			wantRemoveEtcdMemberCalled: 1,
+		},
+		{
+			name: "Do not remove additional etcd members when the target etcd cluster is not healthy",
+			controlPlane: &internal.ControlPlane{
+				KCP: &controlplanev1.KubeadmControlPlane{},
+				Machines: collections.Machines{
+					m1.Name: func() *clusterv1.Machine {
+						m := m1.DeepCopy()
+						conditions.Set(m, metav1.Condition{Type: controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.KubeadmControlPlaneMachineEtcdMemberNotHealthyReason})
+						return m
+					}(),
+				},
+			},
+			additionalEtcdMembers: []*etcd.Member{
+				{Name: "foo"},
+			},
+			wantResult:                 ctrl.Result{},
+			wantRemoveEtcdMemberCalled: 0,
+			wantErr:                    true,
+		},
+		{
+			name: "Consider alarms from external members when computing target etcd cluster status",
+			controlPlane: &internal.ControlPlane{
+				KCP: &controlplanev1.KubeadmControlPlane{},
+				Machines: collections.Machines{
+					m1.Name: func() *clusterv1.Machine {
+						m := m1.DeepCopy()
+						conditions.Set(m, metav1.Condition{Type: controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyReason})
+						return m
+					}(),
+				},
+				EtcdMembersAlarms: []etcd.MemberAlarm{
+					{
+						MemberID: 2,
+						Type:     etcd.AlarmNoSpace,
+					},
+				},
+			},
+			additionalEtcdMembers: []*etcd.Member{
+				{Name: "foo", ID: 1},
+				{Name: "bar", ID: 2},
+			},
+			wantResult:                 ctrl.Result{},
+			wantRemoveEtcdMemberCalled: 0,
+			wantErr:                    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			workloadCluster := fakeWorkloadCluster{}
+			tt.controlPlane.InjectTestManagementCluster(&fakeManagementCluster{
+				Workload: &workloadCluster,
+			})
+			tt.controlPlane.EtcdMembers = append(etcdMembers(tt.controlPlane.Machines), tt.additionalEtcdMembers...)
+
+			r := &KubeadmControlPlaneReconciler{}
+			res, err := r.reconcileEtcdMembers(ctx, tt.controlPlane)
+			if tt.wantErr {
+				g.Expect(err).To(HaveOccurred())
+			} else {
+				g.Expect(err).ToNot(HaveOccurred())
+			}
+			g.Expect(res).To(Equal(tt.wantResult))
+			g.Expect(workloadCluster.removeEtcdMemberCalled).To(Equal(tt.wantRemoveEtcdMemberCalled))
+		})
+	}
+}
+
 func TestKubeadmControlPlaneReconciler_reconcilePreTerminateHook(t *testing.T) {
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3098,12 +3418,34 @@ func TestKubeadmControlPlaneReconciler_reconcilePreTerminateHook(t *testing.T) {
 				controlplanev1.PreTerminateHookCleanupAnnotation: "",
 			},
 		},
+		Status: clusterv1.MachineStatus{
+			NodeRef: clusterv1.MachineNodeReference{
+				Name: "machine-node",
+			},
+		},
 	}
+	setK8sControlPlaneHealthy := func(machine *clusterv1.Machine) {
+		conditions.Set(machine, metav1.Condition{Type: controlplanev1.KubeadmControlPlaneMachineAPIServerPodHealthyCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.KubeadmControlPlaneMachinePodRunningReason})
+		conditions.Set(machine, metav1.Condition{Type: controlplanev1.KubeadmControlPlaneMachineControllerManagerPodHealthyCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.KubeadmControlPlaneMachinePodRunningReason})
+		conditions.Set(machine, metav1.Condition{Type: controlplanev1.KubeadmControlPlaneMachineSchedulerPodHealthyCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.KubeadmControlPlaneMachinePodRunningReason})
+		conditions.Set(machine, metav1.Condition{Type: controlplanev1.KubeadmControlPlaneMachineEtcdPodHealthyCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.KubeadmControlPlaneMachinePodRunningReason})
+	}
+	setEtcdMemeberHealthy := func(machine *clusterv1.Machine) {
+		conditions.Set(machine, metav1.Condition{Type: controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyCondition, Status: metav1.ConditionTrue, Reason: controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyReason})
+	}
+	setK8sControlPlaneHealthy(machine)
+	setEtcdMemeberHealthy(machine)
+
 	deletingMachine := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "deleting-machine",
 			DeletionTimestamp: &metav1.Time{Time: time.Now()},
 			Finalizers:        []string{clusterv1.MachineFinalizer},
+		},
+		Status: clusterv1.MachineStatus{
+			NodeRef: clusterv1.MachineNodeReference{
+				Name: "deleting-machine-node",
+			},
 		},
 	}
 	deletingMachineWithKCPPreTerminateHook := &clusterv1.Machine{
@@ -3113,6 +3455,11 @@ func TestKubeadmControlPlaneReconciler_reconcilePreTerminateHook(t *testing.T) {
 			Finalizers:        []string{clusterv1.MachineFinalizer},
 			Annotations: map[string]string{
 				controlplanev1.PreTerminateHookCleanupAnnotation: "",
+			},
+		},
+		Status: clusterv1.MachineStatus{
+			NodeRef: clusterv1.MachineNodeReference{
+				Name: "deleting-machine-with-kcp-pre-terminate-hook-node",
 			},
 		},
 	}
@@ -3126,16 +3473,21 @@ func TestKubeadmControlPlaneReconciler_reconcilePreTerminateHook(t *testing.T) {
 				clusterv1.PreTerminateDeleteHookAnnotationPrefix + "/test": "",
 			},
 		},
+		Status: clusterv1.MachineStatus{
+			NodeRef: clusterv1.MachineNodeReference{
+				Name: "deleting-machine-with-kcp-and-other-pre-terminate-hooks-node",
+			},
+		},
 	}
 
 	tests := []struct {
-		name                                 string
-		controlPlane                         *internal.ControlPlane
-		wantResult                           ctrl.Result
-		wantErr                              string
-		wantForwardEtcdLeadershipCalled      int
-		wantRemoveEtcdMemberForMachineCalled int
-		wantMachineAnnotations               map[string]map[string]string
+		name                            string
+		controlPlane                    *internal.ControlPlane
+		wantResult                      ctrl.Result
+		wantErr                         string
+		wantForwardEtcdLeadershipCalled int
+		wantRemoveEtcdMemberCalled      int
+		wantMachineAnnotations          map[string]map[string]string
 	}{
 		{
 			name: "Do nothing if there are no deleting Machines",
@@ -3267,12 +3619,72 @@ func TestKubeadmControlPlaneReconciler_reconcilePreTerminateHook(t *testing.T) {
 					}(),
 				},
 			},
-			wantForwardEtcdLeadershipCalled:      1,
-			wantRemoveEtcdMemberForMachineCalled: 1,
-			wantResult:                           ctrl.Result{RequeueAfter: deleteRequeueAfter},
+			wantForwardEtcdLeadershipCalled: 1,
+			wantRemoveEtcdMemberCalled:      1,
+			wantResult:                      ctrl.Result{RequeueAfter: deleteRequeueAfter},
 			wantMachineAnnotations: map[string]map[string]string{
 				machine.Name: machine.Annotations, // unchanged
 				deletingMachineWithKCPPreTerminateHook.Name: nil, // pre-terminate hook has been removed
+			},
+		},
+		{
+			name: "Requeue when target k8s control plane will be in unhealthy state",
+			controlPlane: &internal.ControlPlane{
+				Cluster: cluster,
+				KCP: &controlplanev1.KubeadmControlPlane{
+					Spec: controlplanev1.KubeadmControlPlaneSpec{
+						Version: "v1.31.0",
+					},
+				},
+				Machines: collections.Machines{
+					machine.Name: func() *clusterv1.Machine { // Leadership will be forwarded to this Machine.
+						m := machine.DeepCopy()
+						conditions.Set(m, metav1.Condition{Type: controlplanev1.KubeadmControlPlaneMachineAPIServerPodHealthyCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.KubeadmControlPlaneMachinePodFailedReason})
+						return m
+					}(),
+					deletingMachineWithKCPPreTerminateHook.Name: func() *clusterv1.Machine {
+						m := deletingMachineWithKCPPreTerminateHook.DeepCopy()
+						conditions.Set(m, metav1.Condition{Type: clusterv1.MachineDeletingCondition, Status: metav1.ConditionTrue, Reason: clusterv1.MachineDeletingWaitingForPreTerminateHookReason})
+						return m
+					}(),
+				},
+			},
+			wantForwardEtcdLeadershipCalled: 0,
+			wantRemoveEtcdMemberCalled:      0,
+			wantResult:                      ctrl.Result{RequeueAfter: deleteRequeueAfter},
+			wantMachineAnnotations: map[string]map[string]string{
+				machine.Name: machine.Annotations, // unchanged
+				deletingMachineWithKCPPreTerminateHook.Name: deletingMachineWithKCPPreTerminateHook.Annotations, // unchanged
+			},
+		},
+		{
+			name: "Requeue when target etcd cluster will be in unhealthy state",
+			controlPlane: &internal.ControlPlane{
+				Cluster: cluster,
+				KCP: &controlplanev1.KubeadmControlPlane{
+					Spec: controlplanev1.KubeadmControlPlaneSpec{
+						Version: "v1.31.0",
+					},
+				},
+				Machines: collections.Machines{
+					machine.Name: func() *clusterv1.Machine { // Leadership will be forwarded to this Machine.
+						m := machine.DeepCopy()
+						conditions.Set(m, metav1.Condition{Type: controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyCondition, Status: metav1.ConditionFalse, Reason: controlplanev1.KubeadmControlPlaneMachineEtcdMemberNotHealthyReason})
+						return m
+					}(),
+					deletingMachineWithKCPPreTerminateHook.Name: func() *clusterv1.Machine {
+						m := deletingMachineWithKCPPreTerminateHook.DeepCopy()
+						conditions.Set(m, metav1.Condition{Type: clusterv1.MachineDeletingCondition, Status: metav1.ConditionTrue, Reason: clusterv1.MachineDeletingWaitingForPreTerminateHookReason})
+						return m
+					}(),
+				},
+			},
+			wantForwardEtcdLeadershipCalled: 0,
+			wantRemoveEtcdMemberCalled:      0,
+			wantResult:                      ctrl.Result{RequeueAfter: deleteRequeueAfter},
+			wantMachineAnnotations: map[string]map[string]string{
+				machine.Name: machine.Annotations, // unchanged
+				deletingMachineWithKCPPreTerminateHook.Name: deletingMachineWithKCPPreTerminateHook.Annotations, // unchanged
 			},
 		},
 		{
@@ -3294,14 +3706,17 @@ func TestKubeadmControlPlaneReconciler_reconcilePreTerminateHook(t *testing.T) {
 					deletingMachineWithKCPPreTerminateHook.Name + "-2": func() *clusterv1.Machine {
 						m := deletingMachineWithKCPPreTerminateHook.DeepCopy()
 						m.Name += "-2"
+						m.Status.NodeRef.Name += "-2"
 						conditions.Set(m, metav1.Condition{Type: clusterv1.MachineDeletingCondition, Status: metav1.ConditionTrue, Reason: clusterv1.MachineDeletingWaitingForPreTerminateHookReason})
+						setK8sControlPlaneHealthy(m)
+						setEtcdMemeberHealthy(m)
 						return m
 					}(),
 				},
 			},
-			wantForwardEtcdLeadershipCalled:      0, // skipped as there is no non-deleting Machine to forward to.
-			wantRemoveEtcdMemberForMachineCalled: 1,
-			wantResult:                           ctrl.Result{RequeueAfter: deleteRequeueAfter},
+			wantForwardEtcdLeadershipCalled: 0, // skipped as there is no non-deleting Machine to forward to.
+			wantRemoveEtcdMemberCalled:      1,
+			wantResult:                      ctrl.Result{RequeueAfter: deleteRequeueAfter},
 			wantMachineAnnotations: map[string]map[string]string{
 				deletingMachineWithKCPPreTerminateHook.Name:        nil,                                                // pre-terminate hook has been removed
 				deletingMachineWithKCPPreTerminateHook.Name + "-2": deletingMachineWithKCPPreTerminateHook.Annotations, // unchanged
@@ -3324,9 +3739,9 @@ func TestKubeadmControlPlaneReconciler_reconcilePreTerminateHook(t *testing.T) {
 					}(),
 				},
 			},
-			wantForwardEtcdLeadershipCalled:      0, // skipped
-			wantRemoveEtcdMemberForMachineCalled: 0, // skipped
-			wantResult:                           ctrl.Result{RequeueAfter: deleteRequeueAfter},
+			wantForwardEtcdLeadershipCalled: 0, // skipped
+			wantRemoveEtcdMemberCalled:      0, // skipped
+			wantResult:                      ctrl.Result{RequeueAfter: deleteRequeueAfter},
 			wantMachineAnnotations: map[string]map[string]string{
 				deletingMachineWithKCPPreTerminateHook.Name: nil, // pre-terminate hook has been removed
 			},
@@ -3358,9 +3773,36 @@ func TestKubeadmControlPlaneReconciler_reconcilePreTerminateHook(t *testing.T) {
 					}(),
 				},
 			},
-			wantForwardEtcdLeadershipCalled:      0, // skipped
-			wantRemoveEtcdMemberForMachineCalled: 0, // skipped
-			wantResult:                           ctrl.Result{RequeueAfter: deleteRequeueAfter},
+			wantForwardEtcdLeadershipCalled: 0, // skipped
+			wantRemoveEtcdMemberCalled:      0, // skipped
+			wantResult:                      ctrl.Result{RequeueAfter: deleteRequeueAfter},
+			wantMachineAnnotations: map[string]map[string]string{
+				machine.Name: machine.Annotations, // unchanged
+				deletingMachineWithKCPPreTerminateHook.Name: nil, // pre-terminate hook has been removed
+			},
+		},
+		{
+			name: "Skip forward etcd leadership, skip remove member and remove pre-terminate hook if > 1 CP Machines without a node",
+			controlPlane: &internal.ControlPlane{
+				Cluster: cluster,
+				KCP: &controlplanev1.KubeadmControlPlane{
+					Spec: controlplanev1.KubeadmControlPlaneSpec{
+						Version: "v1.31.0",
+					},
+				},
+				Machines: collections.Machines{
+					machine.Name: machine,
+					deletingMachineWithKCPPreTerminateHook.Name: func() *clusterv1.Machine {
+						m := deletingMachineWithKCPPreTerminateHook.DeepCopy()
+						m.Status.NodeRef.Name = ""
+						conditions.Set(m, metav1.Condition{Type: clusterv1.MachineDeletingCondition, Status: metav1.ConditionTrue, Reason: clusterv1.MachineDeletingWaitingForPreTerminateHookReason})
+						return m
+					}(),
+				},
+			},
+			wantForwardEtcdLeadershipCalled: 0, // skipped
+			wantRemoveEtcdMemberCalled:      0, // skipped
+			wantResult:                      ctrl.Result{RequeueAfter: deleteRequeueAfter},
 			wantMachineAnnotations: map[string]map[string]string{
 				machine.Name: machine.Annotations, // unchanged
 				deletingMachineWithKCPPreTerminateHook.Name: nil, // pre-terminate hook has been removed
@@ -3387,6 +3829,8 @@ func TestKubeadmControlPlaneReconciler_reconcilePreTerminateHook(t *testing.T) {
 				Workload: &workloadCluster,
 			})
 
+			tt.controlPlane.EtcdMembers = etcdMembers(tt.controlPlane.Machines)
+
 			res, err := r.reconcilePreTerminateHook(ctx, tt.controlPlane)
 			if tt.wantErr != "" {
 				g.Expect(err).To(HaveOccurred())
@@ -3397,7 +3841,7 @@ func TestKubeadmControlPlaneReconciler_reconcilePreTerminateHook(t *testing.T) {
 			g.Expect(res).To(Equal(tt.wantResult))
 
 			g.Expect(workloadCluster.forwardEtcdLeadershipCalled).To(Equal(tt.wantForwardEtcdLeadershipCalled))
-			g.Expect(workloadCluster.removeEtcdMemberForMachineCalled).To(Equal(tt.wantRemoveEtcdMemberForMachineCalled))
+			g.Expect(workloadCluster.removeEtcdMemberCalled).To(Equal(tt.wantRemoveEtcdMemberCalled))
 
 			machineList := &clusterv1.MachineList{}
 			g.Expect(fakeClient.List(ctx, machineList)).To(Succeed())
@@ -4103,6 +4547,7 @@ func createClusterWithControlPlane(namespace string) (*clusterv1.Cluster, *contr
 func setKCPHealthy(kcp *controlplanev1.KubeadmControlPlane) {
 	conditions.Set(kcp, metav1.Condition{Type: controlplanev1.KubeadmControlPlaneControlPlaneComponentsHealthyCondition, Status: metav1.ConditionTrue})
 	conditions.Set(kcp, metav1.Condition{Type: controlplanev1.KubeadmControlPlaneEtcdClusterHealthyCondition, Status: metav1.ConditionTrue})
+	conditions.Set(kcp, metav1.Condition{Type: controlplanev1.KubeadmControlPlaneCertificatesAvailableCondition, Status: metav1.ConditionTrue})
 }
 
 func createMachineNodePair(name string, cluster *clusterv1.Cluster, kcp *controlplanev1.KubeadmControlPlane, ready bool) (*clusterv1.Machine, *corev1.Node) {

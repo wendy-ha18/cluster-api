@@ -176,6 +176,10 @@ type ScaleSpecInput struct {
 	// if the test suit should fail as soon as c6 fails or if it should fail after all cluster creations are done.
 	FailFast bool
 
+	// DumpResources instruct the test to dumo resources from the test namespace as well as from the
+	// cluster namespaces.
+	DumpResources bool
+
 	// SkipUpgrade if set to true will skip upgrading the workload clusters.
 	SkipUpgrade bool
 
@@ -192,10 +196,12 @@ type ScaleSpecInput struct {
 // ScaleSpec implements a scale test for clusters with MachineDeployments.
 func ScaleSpec(ctx context.Context, inputGetter func() ScaleSpecInput) {
 	var (
-		specName      = "scale"
-		input         ScaleSpecInput
-		namespace     *corev1.Namespace
-		cancelWatches context.CancelFunc
+		specName                          = "scale"
+		input                             ScaleSpecInput
+		namespace                         *corev1.Namespace
+		deployClusterInSeparateNamespaces bool
+		clusterNames                      []string
+		cancelWatches                     context.CancelFunc
 	)
 
 	BeforeEach(func() {
@@ -263,7 +269,7 @@ func ScaleSpec(ctx context.Context, inputGetter func() ScaleSpecInput) {
 		additionalClusterClassCount := *cmp.Or(variableAsInt64(input.E2EConfig.GetVariableOrEmpty(scaleAdditionalClusterClassCount)),
 			input.AdditionalClusterClassCount, ptr.To[int64](0),
 		)
-		deployClusterInSeparateNamespaces := *cmp.Or(variableAsBool(input.E2EConfig.GetVariableOrEmpty(scaleDeployClusterInSeparateNamespaces)),
+		deployClusterInSeparateNamespaces = *cmp.Or(variableAsBool(input.E2EConfig.GetVariableOrEmpty(scaleDeployClusterInSeparateNamespaces)),
 			input.DeployClusterInSeparateNamespaces, ptr.To[bool](false),
 		)
 		useCrossNamespaceClusterClass := *cmp.Or(variableAsBool(input.E2EConfig.GetVariableOrEmpty(scaleUseCrossNamespaceClusterClass)),
@@ -375,7 +381,7 @@ func ScaleSpec(ctx context.Context, inputGetter func() ScaleSpecInput) {
 		By("Create workload clusters concurrently")
 		// Create multiple clusters concurrently from the same base cluster template.
 
-		clusterNames := make([]string, 0, clusterCount)
+		clusterNames = make([]string, 0, clusterCount)
 		clusterNameDigits := 1 + int(math.Log10(float64(clusterCount)))
 		for i := int64(1); i <= clusterCount; i++ {
 			// This ensures we always have the right number of leading zeros in our cluster names, e.g.
@@ -517,11 +523,59 @@ func ScaleSpec(ctx context.Context, inputGetter func() ScaleSpecInput) {
 	})
 
 	AfterEach(func() {
+		if input.DumpResources {
+			// Dump all Cluster API related resources from the scale namespace to artifacts.
+			Byf("Dumping resources for namespace %s", namespace.Name)
+			func() {
+				_ = recover()
+				framework.DumpAllResources(ctx, framework.DumpAllResourcesInput{
+					Lister:               input.BootstrapClusterProxy.GetClient(),
+					KubeConfigPath:       input.BootstrapClusterProxy.GetKubeconfigPath(),
+					ClusterctlConfigPath: input.ClusterctlConfigPath,
+					Namespace:            namespace.Name,
+					LogPath:              filepath.Join(input.ArtifactFolder, "clusters", input.BootstrapClusterProxy.GetName(), "resources"),
+				})
+			}()
+
+			// Dump all Cluster API related resources from clusters created outside the scale namespace to artifacts.
+			if deployClusterInSeparateNamespaces {
+				for _, clusterName := range clusterNames {
+					namespaceName := clusterName
+
+					Byf("Dumping resources for namespace %s", namespaceName)
+					func() {
+						_ = recover()
+						framework.DumpAllResources(ctx, framework.DumpAllResourcesInput{
+							Lister:               input.BootstrapClusterProxy.GetClient(),
+							KubeConfigPath:       input.BootstrapClusterProxy.GetKubeconfigPath(),
+							ClusterctlConfigPath: input.ClusterctlConfigPath,
+							Namespace:            namespaceName,
+							LogPath:              filepath.Join(input.ArtifactFolder, "clusters", input.BootstrapClusterProxy.GetName(), "resources"),
+						})
+					}()
+				}
+			}
+		}
+
 		if !input.SkipCleanup {
 			if input.ExtensionServiceNamespace != "" && input.ExtensionServiceName != "" {
 				Eventually(func() error {
 					return input.BootstrapClusterProxy.GetClient().Delete(ctx, &runtimev1.ExtensionConfig{ObjectMeta: metav1.ObjectMeta{Name: input.ExtensionConfigName}})
 				}, 10*time.Second, 1*time.Second).Should(Succeed(), "Deleting ExtensionConfig failed")
+			}
+			Byf("Deleting namespace used for hosting the %q test spec", specName)
+			framework.DeleteNamespace(ctx, framework.DeleteNamespaceInput{
+				Deleter: input.BootstrapClusterProxy.GetClient(),
+				Name:    namespace.Name,
+			})
+			if deployClusterInSeparateNamespaces {
+				for _, clusterName := range clusterNames {
+					namespaceName := clusterName
+					framework.DeleteNamespace(ctx, framework.DeleteNamespaceInput{
+						Deleter: input.BootstrapClusterProxy.GetClient(),
+						Name:    namespaceName,
+					})
+				}
 			}
 		}
 		cancelWatches()
@@ -649,7 +703,7 @@ func getClusterCreateAndWaitFn(input clusterctl.ApplyCustomClusterTemplateAndWai
 			WaitForClusterIntervals:      input.WaitForClusterIntervals,
 			WaitForControlPlaneIntervals: input.WaitForControlPlaneIntervals,
 			WaitForMachineDeployments:    input.WaitForMachineDeployments,
-			CreateOrUpdateOpts:           input.CreateOrUpdateOpts,
+			CreateOpts:                   input.CreateOpts,
 			PreWaitForCluster:            input.PreWaitForCluster,
 			PostMachinesProvisioned:      input.PostMachinesProvisioned,
 			ControlPlaneWaiters:          input.ControlPlaneWaiters,
@@ -745,12 +799,15 @@ func createClusterWorker(ctx context.Context, clusterProxy framework.ClusterProx
 
 				// Adjust namespace and name in Cluster YAML
 				clusterTemplateYAML := customizedClusterTemplateYAML
+				// Replace Cluster.metadata.namespace.
+				clusterTemplateYAML = bytes.Replace(clusterTemplateYAML, []byte(scaleClusterNamespacePlaceholder), []byte(namespaceName), 1)
 				if enableCrossNamespaceClusterClass {
-					// Set classNamespace to the defaultNamespace where the ClusterClass is located.
-					clusterTemplateYAML = bytes.ReplaceAll(clusterTemplateYAML,
-						[]byte(fmt.Sprintf("classNamespace: %s", scaleClusterNamespacePlaceholder)),
-						[]byte(fmt.Sprintf("classNamespace: %s", defaultNamespace)))
+					// Replace Cluster.spec.topology.classRef.namespace to the defaultNamespace where the ClusterClass is located.
+					clusterTemplateYAML = bytes.Replace(clusterTemplateYAML,
+						[]byte(fmt.Sprintf("namespace: %s", scaleClusterNamespacePlaceholder)),
+						[]byte(fmt.Sprintf("namespace: %s", defaultNamespace)), 1)
 				}
+				// Replace any other occurrences of scaleClusterNamespacePlaceholder.
 				clusterTemplateYAML = bytes.ReplaceAll(clusterTemplateYAML, []byte(scaleClusterNamespacePlaceholder), []byte(namespaceName))
 				clusterTemplateYAML = bytes.ReplaceAll(clusterTemplateYAML, []byte(scaleClusterNamePlaceholder), []byte(clusterName))
 

@@ -18,6 +18,7 @@ package machineset
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
@@ -47,10 +49,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	runtimev1 "sigs.k8s.io/cluster-api/api/runtime/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/internal/contract"
+	"sigs.k8s.io/cluster-api/internal/hooks"
 	"sigs.k8s.io/cluster-api/internal/util/ssa"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
@@ -1387,6 +1391,9 @@ func TestMachineSetReconciler_syncMachines(t *testing.T) {
 				"dropped-annotation":   "dropped-value",
 				"modified-annotation":  "modified-value",
 			},
+			// Setting finalizer like the MachineSet controller would do, this avoids race conditions with
+			// the Machine controller that influence field ownership.
+			Finalizers: []string{clusterv1.MachineFinalizer},
 		},
 		Spec: clusterv1.MachineSpec{
 			ClusterName: testCluster.Name,
@@ -1478,8 +1485,9 @@ func TestMachineSetReconciler_syncMachines(t *testing.T) {
 		machines:   machines,
 		getAndAdoptMachinesForMachineSetSucceeded: true,
 	}
-	_, err = reconciler.syncMachines(ctx, s)
+	_, stopReconcile, err := reconciler.syncMachines(ctx, s)
 	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(stopReconcile).To(BeFalse())
 
 	updatedInPlaceMutatingMachine := inPlaceMutatingMachine.DeepCopy()
 	g.Eventually(func(g Gomega) {
@@ -1492,12 +1500,6 @@ func TestMachineSetReconciler_syncMachines(t *testing.T) {
 			Operation:  metav1.ManagedFieldsOperationApply,
 			APIVersion: clusterv1.GroupVersion.String(),
 			FieldsV1:   fmt.Sprintf("{\"f:metadata\":{\"f:annotations\":{\"f:dropped-annotation\":{},\"f:modified-annotation\":{},\"f:preserved-annotation\":{}},\"f:finalizers\":{\"v:\\\"machine.cluster.x-k8s.io\\\"\":{}},\"f:labels\":{\"f:cluster.x-k8s.io/set-name\":{},\"f:dropped-label\":{},\"f:modified-label\":{},\"f:preserved-label\":{}},\"f:ownerReferences\":{\"k:{\\\"uid\\\":\\\"%s\\\"}\":{}}},\"f:spec\":{\"f:bootstrap\":{\"f:configRef\":{\"f:apiGroup\":{},\"f:kind\":{},\"f:name\":{}}},\"f:clusterName\":{},\"f:infrastructureRef\":{\"f:apiGroup\":{},\"f:kind\":{},\"f:name\":{}}}}", ms.UID),
-		}, {
-			// manager owns the finalizer.
-			Manager:    "manager",
-			Operation:  metav1.ManagedFieldsOperationUpdate,
-			APIVersion: clusterv1.GroupVersion.String(),
-			FieldsV1:   "{\"f:metadata\":{\"f:finalizers\":{\".\":{},\"v:\\\"machine.cluster.x-k8s.io\\\"\":{}}}}",
 		}, {
 			// manager owns status.
 			Manager:    "manager",
@@ -1593,8 +1595,9 @@ func TestMachineSetReconciler_syncMachines(t *testing.T) {
 		machines:   []*clusterv1.Machine{updatedInPlaceMutatingMachine, deletingMachine},
 		getAndAdoptMachinesForMachineSetSucceeded: true,
 	}
-	_, err = reconciler.syncMachines(ctx, s)
+	_, stopReconcile, err = reconciler.syncMachines(ctx, s)
 	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(stopReconcile).To(BeFalse())
 
 	// Verify in-place mutable fields are updated on the Machine.
 	updatedInPlaceMutatingMachine = inPlaceMutatingMachine.DeepCopy()
@@ -1672,6 +1675,56 @@ func TestMachineSetReconciler_syncMachines(t *testing.T) {
 	deletingMachine.Spec.ReadinessGates = ms.Spec.Template.Spec.ReadinessGates
 	deletingMachine.Spec.Taints = machineTaints
 	g.Expect(updatedDeletingMachine.Spec).Should(BeComparableTo(deletingMachine.Spec))
+
+	//
+	// Verify managedField mitigation (purge managedFields and verify they are re-added)
+	//
+	// Remove managedField entries
+	jsonPatch := []map[string]interface{}{
+		{
+			"op":    "replace",
+			"path":  "/metadata/managedFields",
+			"value": []metav1.ManagedFieldsEntry{{}},
+		},
+	}
+	patch, err := json.Marshal(jsonPatch)
+	g.Expect(err).ToNot(HaveOccurred())
+	for _, object := range []client.Object{updatedInPlaceMutatingMachine, updatedInfraMachine, updatedBootstrapConfig} {
+		g.Expect(env.Client.Patch(ctx, object, client.RawPatch(types.JSONPatchType, patch))).To(Succeed())
+		g.Expect(object.GetManagedFields()).To(BeEmpty())
+	}
+	// syncMachines to run mitigation code.
+	m := *updatedInPlaceMutatingMachine
+	s = &scope{
+		machineSet: ms,
+		machines:   []*clusterv1.Machine{&m},
+		getAndAdoptMachinesForMachineSetSucceeded: true,
+	}
+	_, stopReconcile, err = reconciler.syncMachines(ctx, s)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(stopReconcile).To(BeTrue())
+	// verify mitigation worked
+	g.Expect(env.GetAPIReader().Get(ctx, client.ObjectKeyFromObject(&m), &m)).To(Succeed())
+	g.Expect(cleanupTime(m.GetManagedFields())).To(ConsistOf(toManagedFields([]managedFieldEntry{{
+		APIVersion: clusterv1.GroupVersion.String(),
+		Manager:    machineSetManagerName, // matches manager of next Apply.
+		Operation:  metav1.ManagedFieldsOperationApply,
+		FieldsV1:   `{"f:metadata":{"f:name":{}}}`,
+	}})))
+	g.Expect(env.GetAPIReader().Get(ctx, client.ObjectKeyFromObject(updatedInfraMachine), updatedInfraMachine)).To(Succeed())
+	g.Expect(cleanupTime(updatedInfraMachine.GetManagedFields())).To(ConsistOf(toManagedFields([]managedFieldEntry{{
+		APIVersion: updatedInfraMachine.GetAPIVersion(),
+		Manager:    machineSetMetadataManagerName, // matches manager of next Apply.
+		Operation:  metav1.ManagedFieldsOperationApply,
+		FieldsV1:   `{"f:metadata":{"f:name":{}}}`,
+	}})))
+	g.Expect(env.GetAPIReader().Get(ctx, client.ObjectKeyFromObject(updatedBootstrapConfig), updatedBootstrapConfig)).To(Succeed())
+	g.Expect(cleanupTime(updatedBootstrapConfig.GetManagedFields())).To(ConsistOf(toManagedFields([]managedFieldEntry{{
+		APIVersion: updatedBootstrapConfig.GetAPIVersion(),
+		Manager:    machineSetMetadataManagerName, // matches manager of next Apply.
+		Operation:  metav1.ManagedFieldsOperationApply,
+		FieldsV1:   `{"f:metadata":{"f:name":{}}}`,
+	}})))
 }
 
 func TestMachineSetReconciler_reconcileUnhealthyMachines(t *testing.T) {
@@ -2543,7 +2596,7 @@ func TestMachineSetReconciler_createMachines_preflightChecks(t *testing.T) {
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithObjects(controlPlaneUpgrading, builder.GenericControlPlaneCRD, machineSet).WithStatusSubresource(&clusterv1.MachineSet{}).Build()
+	fakeClient := fake.NewClientBuilder().WithObjects(controlPlaneUpgrading, builder.GenericControlPlaneCRD, machineSet).WithStatusSubresource(&clusterv1.MachineSet{}).WithScheme(fakeScheme).Build()
 	r := &Reconciler{
 		Client:          fakeClient,
 		PreflightChecks: sets.Set[clusterv1.MachineSetPreflightCheck]{}.Insert(clusterv1.MachineSetPreflightCheckAll),
@@ -2706,18 +2759,6 @@ func TestMachineSetReconciler_createMachines(t *testing.T) {
 				bootstrapTmpl,
 				infraTmpl,
 			).WithInterceptorFuncs(tt.interceptorFuncs(&i)).Build()
-
-			// TODO(controller-runtime-0.23): This workaround is needed because controller-runtime v0.22 does not set resourceVersion correctly with SSA (fixed with v0.23).
-			fakeClient = interceptor.NewClient(fakeClient, interceptor.Funcs{
-				Apply: func(ctx context.Context, c client.WithWatch, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
-					clientObject, ok := obj.(client.Object)
-					if !ok {
-						return errors.Errorf("error during object creation: unexpected ApplyConfiguration")
-					}
-					clientObject.SetResourceVersion("1")
-					return c.Apply(ctx, obj, opts...)
-				},
-			})
 
 			r := &Reconciler{
 				Client:   fakeClient,
@@ -3478,10 +3519,19 @@ func TestMachineSetReconciler_triggerInPlaceUpdate(t *testing.T) {
 			wantErr:                     false,
 		},
 	}
+
+	// We want to test that trigger in place handles version and failure domain, which are not reconciled by syncMachines
+	versionBeforeInplaceUpdate := "v1.33.0"
+	versionAfterInplaceUpdate := "v1.34.0"
+	failureDomainBeforeInplaceUpdate := "fd-1"
+	failureDomainAfterInplaceUpdate := "fd-2"
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			g := NewWithT(t)
 
+			tt.ms.Spec.Template.Spec.Version = versionAfterInplaceUpdate
+			tt.ms.Spec.Template.Spec.FailureDomain = failureDomainAfterInplaceUpdate
 			tt.ms.Spec.Template.Spec.InfrastructureRef = clusterv1.ContractVersionedObjectReference{
 				APIGroup: infraTmpl.GroupVersionKind().Group,
 				Kind:     infraTmpl.GetKind(),
@@ -3507,6 +3557,15 @@ func TestMachineSetReconciler_triggerInPlaceUpdate(t *testing.T) {
 
 			for _, m := range tt.machines {
 				m.SetNamespace(tt.ms.Namespace)
+
+				if hooks.IsPending(runtimehooksv1.UpdateMachine, m) {
+					m.Spec.Version = versionAfterInplaceUpdate
+					m.Spec.FailureDomain = failureDomainAfterInplaceUpdate
+				} else {
+					// NOTE: following values must be changed when in place upgrade is triggered for a machine
+					m.Spec.Version = versionBeforeInplaceUpdate
+					m.Spec.FailureDomain = failureDomainBeforeInplaceUpdate
+				}
 
 				mInfraObj := infraObj.DeepCopy()
 				mInfraObj.SetName(m.Name)
@@ -3552,6 +3611,15 @@ func TestMachineSetReconciler_triggerInPlaceUpdate(t *testing.T) {
 
 			updatingMachines := machinesInPlaceUpdating(machines)
 			g.Expect(updatingMachines).To(ConsistOf(tt.wantMachinesInPlaceUpdating))
+			for _, m := range machines.Items {
+				if hooks.IsPending(runtimehooksv1.UpdateMachine, &m) {
+					g.Expect(m.Spec.Version).To(Equal(versionAfterInplaceUpdate))
+					g.Expect(m.Spec.FailureDomain).To(Equal(failureDomainAfterInplaceUpdate))
+				} else {
+					g.Expect(m.Spec.Version).To(Equal(versionBeforeInplaceUpdate))
+					g.Expect(m.Spec.FailureDomain).To(Equal(failureDomainBeforeInplaceUpdate))
+				}
+			}
 		})
 	}
 }
@@ -3966,8 +4034,9 @@ func TestReconciler_reconcileDelete(t *testing.T) {
 			}
 
 			// populate s.machines
-			_, err := r.getAndAdoptMachinesForMachineSet(ctx, s)
+			_, stopReconcile, err := r.getAndAdoptMachinesForMachineSet(ctx, s)
 			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(stopReconcile).To(BeFalse())
 			_, err = r.reconcileDelete(ctx, s)
 			if tt.expectError {
 				g.Expect(err).To(HaveOccurred())
@@ -4121,4 +4190,159 @@ func managedFieldsMatching(managedFields []metav1.ManagedFieldsEntry, manager st
 		}
 	}
 	return res
+}
+
+func TestReconciler_completeMoveMachine(t *testing.T) {
+	testCluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: testClusterName},
+	}
+
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(apiextensionsv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+
+	// Create bootstrap template resource.
+	bootstrapResource := map[string]interface{}{
+		"kind":       "GenericBootstrapConfig",
+		"apiVersion": clusterv1.GroupVersionBootstrap.String(),
+		"spec":       map[string]interface{}{},
+	}
+	bootstrapTmpl := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"spec": map[string]interface{}{
+				"template": bootstrapResource,
+			},
+		},
+	}
+	bootstrapTmpl.SetKind("GenericBootstrapConfigTemplate")
+	bootstrapTmpl.SetAPIVersion(clusterv1.GroupVersionBootstrap.String())
+	bootstrapTmpl.SetName("ms-template")
+	bootstrapTmpl.SetNamespace(metav1.NamespaceDefault)
+
+	// Create infrastructure template resource.
+	infraResource := map[string]interface{}{
+		"kind":       "GenericInfrastructureMachine",
+		"apiVersion": clusterv1.GroupVersionInfrastructure.String(),
+		"spec":       map[string]interface{}{},
+	}
+	infraTmpl := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"spec": map[string]interface{}{
+				"template": infraResource,
+			},
+		},
+	}
+	infraTmpl.SetKind("GenericInfrastructureMachineTemplate")
+	infraTmpl.SetAPIVersion(clusterv1.GroupVersionInfrastructure.String())
+	infraTmpl.SetName("ms-template")
+	infraTmpl.SetNamespace(metav1.NamespaceDefault)
+
+	// Create a MachineSet with a specific version and failure domain
+	machineSet := &clusterv1.MachineSet{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "ms-",
+			Namespace:    metav1.NamespaceDefault,
+		},
+		Spec: clusterv1.MachineSetSpec{
+			ClusterName: testClusterName,
+			Template: clusterv1.MachineTemplateSpec{
+				Spec: clusterv1.MachineSpec{
+					ClusterName: testClusterName,
+					InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+						Kind:     "GenericInfrastructureMachineTemplate",
+						Name:     "ms-template",
+						APIGroup: clusterv1.GroupVersionInfrastructure.Group,
+					},
+					Bootstrap: clusterv1.Bootstrap{
+						ConfigRef: clusterv1.ContractVersionedObjectReference{
+							Kind:     "GenericBootstrapConfigTemplate",
+							Name:     "ms-template",
+							APIGroup: clusterv1.GroupVersionBootstrap.Group,
+						},
+					},
+					Version:       "v1.20.0",
+					FailureDomain: "failure-domain-1",
+				},
+			},
+		},
+	}
+
+	bootstrapObj := &unstructured.Unstructured{
+		Object: bootstrapResource["spec"].(map[string]interface{}),
+	}
+	bootstrapObj.SetKind(builder.GenericBootstrapConfigKind)
+	bootstrapObj.SetAPIVersion(clusterv1.GroupVersionBootstrap.String())
+	bootstrapObj.SetNamespace(metav1.NamespaceDefault)
+	bootstrapObj.SetName("current-machine")
+
+	infraObj := &unstructured.Unstructured{
+		Object: infraResource["spec"].(map[string]interface{}),
+	}
+	infraObj.SetKind(builder.GenericInfrastructureMachineKind)
+	infraObj.SetAPIVersion(clusterv1.GroupVersionInfrastructure.String())
+	infraObj.SetNamespace(metav1.NamespaceDefault)
+	infraObj.SetName("current-machine")
+
+	// Create a Machine with a different version and failure domain
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "current-machine",
+			Namespace: metav1.NamespaceDefault,
+		},
+		Spec: clusterv1.MachineSpec{
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				Kind:     "GenericInfrastructureMachine",
+				Name:     "current-machine",
+				APIGroup: clusterv1.GroupVersionInfrastructure.Group,
+			},
+			Bootstrap: clusterv1.Bootstrap{
+				ConfigRef: clusterv1.ContractVersionedObjectReference{
+					Kind:     "GenericBootstrapConfig",
+					Name:     "current-machine",
+					APIGroup: clusterv1.GroupVersionBootstrap.Group,
+				},
+			},
+			ClusterName:   testClusterName,
+			Version:       "v1.19.0",
+			FailureDomain: "failure-domain-2",
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		builder.GenericBootstrapConfigCRD,
+		builder.GenericInfrastructureMachineCRD,
+		builder.GenericBootstrapConfigTemplateCRD,
+		builder.GenericInfrastructureMachineTemplateCRD,
+		bootstrapTmpl,
+		infraTmpl,
+		bootstrapObj,
+		infraObj,
+		testCluster,
+		machineSet,
+		machine,
+	).Build()
+	msr := &Reconciler{
+		Client:   fakeClient,
+		recorder: record.NewFakeRecorder(32),
+	}
+
+	s := &scope{
+		machineSet: machineSet,
+		machines:   []*clusterv1.Machine{machine},
+		getAndAdoptMachinesForMachineSetSucceeded: true,
+	}
+
+	err := msr.completeMoveMachine(ctx, s, machine)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	g.Expect(fakeClient.Get(ctx, client.ObjectKeyFromObject(bootstrapObj), bootstrapObj)).To(Succeed())
+	g.Expect(bootstrapObj.GetAnnotations()).To(HaveKeyWithValue(clusterv1.UpdateInProgressAnnotation, ""))
+
+	g.Expect(fakeClient.Get(ctx, client.ObjectKeyFromObject(infraObj), infraObj)).To(Succeed())
+	g.Expect(infraObj.GetAnnotations()).To(HaveKeyWithValue(clusterv1.UpdateInProgressAnnotation, ""))
+
+	g.Expect(fakeClient.Get(ctx, client.ObjectKeyFromObject(machine), machine)).To(Succeed())
+	g.Expect(machine.Spec.Version).To(Equal(machineSet.Spec.Template.Spec.Version))
+	g.Expect(machine.Spec.FailureDomain).To(Equal(machineSet.Spec.Template.Spec.FailureDomain))
 }

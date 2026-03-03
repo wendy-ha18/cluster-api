@@ -68,6 +68,7 @@ repo or add an item to the agenda in the [Cluster API community meeting](https:/
 | [ControlPlane: version]                                              | No        | Mandatory if control plane allows direct management of the Kubernetes version in use; Mandatory for cluster class support. |
 | [ControlPlane: machines]                                             | No        | Mandatory if control plane instances are represented with a set of Cluster API Machines.                                   |
 | [ControlPlane: initialization completed]                             | Yes       |                                                                                                                            |
+| [ControlPlane: in-place updates]                                     | No        | Only supported for control plane providers with control plane machines                                                     |
 | [ControlPlane: conditions]                                           | No        |                                                                                                                            |
 | [ControlPlane: terminal failures]                                    | No        |                                                                                                                            |
 | [ControlPlaneTemplate, ControlPlaneTemplateList resource definition] | No        | Mandatory for ClusterClasses support                                                                                       |
@@ -170,6 +171,15 @@ labels:
 ```
 
 An example of this is in the [Kubeadm Bootstrap provider](https://github.com/kubernetes-sigs/cluster-api/blob/release-1.1/controlplane/kubeadm/config/crd/kustomization.yaml).
+
+<aside  class="note warning">
+
+<h1>Important</h1>
+
+If the provider implements the [clusterctl provider contract], the contract version defined in the
+label above must be consistent with the contract version defined in the `metadata.yaml` file.
+
+</aside>
 
 ### ControlPlane, ControlPlaneList resource definition
 
@@ -537,6 +547,33 @@ type FooControlPlaneMachineTemplateSpec struct {
 
 NOTE: In the v1beta1 contract the `readinessGates` field was located directly in the `spec.machineTemplate` field.
 
+In case you are developing a control plane provider that allows definition of machine taints, you SHOULD also implement
+the following `spec.machineTemplate.spec` field.
+
+```go
+type FooControlPlaneMachineTemplateSpec struct {
+	// taints are the node taints that Cluster API will manage.
+	// This list is not necessarily complete: other Kubernetes components may add or remove other taints from nodes,
+	// e.g. the node controller might add the node.kubernetes.io/not-ready taint.
+	// Only those taints defined in this list will be added or removed by core Cluster API controllers.
+	//
+	// There can be at most 64 taints.
+	// A pod would have to tolerate all existing taints to run on the corresponding node.
+	//
+	// NOTE: This list is implemented as a "map" type, meaning that individual elements can be managed by different owners.
+	// +optional
+	// +listType=map
+	// +listMapKey=key
+	// +listMapKey=effect
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=64
+	Taints []clusterv1.MachineTaint `json:"taints,omitempty"`
+
+    // See other rules for more details about mandatory/optional fields in ControlPlane spec.
+    // Other fields SHOULD be added based on the needs of your provider.
+}
+```
+
 In case you are developing a control plane provider where control plane instances uses a Cluster API Machine 
 object to represent each control plane instance, but those instances do not show up as a Kubernetes node (for example, 
 managed control plane providers for AKS, EKS, GKE etc), you SHOULD also implement the following `status` field.
@@ -608,16 +645,42 @@ preserves compatibility with the deprecated v1beta1 contract; compatibility will
 
 With regards to initialization completed:
 
-Cluster API will continue to temporarily support ControlPlane resource using `status.initialize` and the `status.ready` field to
+Cluster API will continue to temporarily support ControlPlane resource using the `status.initialized` field to
 report initialization completed.
 
-After compatibility with the deprecated v1beta1 contract will be removed, `status.initialize` and `status.ready` fields in
+After compatibility with the deprecated v1beta1 contract will be removed, the `status.initialized` field in
 the ControlPlane resource will be ignored.
 
 </aside>
 
-### ControlPlane: conditions
+### ControlPlane: in-place updates
 
+In case a control plane provider would like to provide support for in-place updates, please check the [proposal](https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/20240807-in-place-updates.md).
+
+Supporting in-place updates requires:
+- implementing the call for the registered `CanUpdateMachine` hook when performing the "can update in-place" decision.
+- when it is decided to perform the in-place decision:
+  - the machine spec must be updated to the desired state, as well as the spec for the corresponding infrastructure machine and bootstrap config
+  - while updating those objects also the `in-place-updates.internal.cluster.x-k8s.io/update-in-progress` annotation must be set
+  - once all objects are updated the `UpdateMachine` hook must be set as pending on the machine object
+
+After above steps are completed, the machine controller will take over and complete the in-place upgrade.
+
+<aside class="note warning">
+
+<h1>High complexity</h1>
+
+Implementing the in-place update transition in a race condition-free, re-entrant way is more complex than it might seem.
+
+Please read the proposal's [implementation notes](https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240807-in-place-updates-implementation-notes.md)
+carefully.
+
+Also, it is highly recommended to use the KCP implementation as a reference.
+
+</aside>
+
+
+### ControlPlane: conditions
 
 According to [Kubernetes API Conventions], Conditions provide a standard mechanism for higher-level
 status reporting from a controller.
@@ -873,7 +936,8 @@ is implemented in ControlPlane controllers:
 [ControlPlane: machines]: #controlplane-machines
 [In place propagation of changes affecting Kubernetes objects only]: https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20221003-In-place-propagation-of-Kubernetes-objects-only-changes.md
 [ControlPlane: version]: #controlplane-version 
-[ControlPlane: initialization completed]: #controlplane-initialization-completed 
+[ControlPlane: initialization completed]: #controlplane-initialization-completed
+[ControlPlane: in-place updates]: #controlplane-in-place-updates
 [ControlPlane: conditions]: #controlplane-conditions 
 [Kubernetes API Conventions]: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 [Improving status in CAPI resources]: https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240916-improve-status-in-CAPI-resources.md

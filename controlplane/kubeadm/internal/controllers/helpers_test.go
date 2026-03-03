@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -28,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -39,6 +41,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/controlplane/kubeadm/internal"
+	clientutil "sigs.k8s.io/cluster-api/internal/util/client"
 	"sigs.k8s.io/cluster-api/internal/util/ssa"
 	"sigs.k8s.io/cluster-api/util/collections"
 	v1beta1conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
@@ -417,7 +420,9 @@ func TestCloneConfigsAndGenerateMachineAndSyncMachines(t *testing.T) {
 		UID:        kcp.UID,
 	}))
 	g.Expect(kubeadmConfig.Spec.InitConfiguration).To(BeComparableTo(bootstrapv1.InitConfiguration{}))
-	g.Expect(kubeadmConfig.Spec.JoinConfiguration).To(BeComparableTo(kcp.Spec.KubeadmConfigSpec.JoinConfiguration))
+	expectedJoinConfiguration := kcp.Spec.KubeadmConfigSpec.JoinConfiguration.DeepCopy()
+	expectedJoinConfiguration.ControlPlane = &bootstrapv1.JoinControlPlane{}
+	g.Expect(kubeadmConfig.Spec.JoinConfiguration).To(BeComparableTo(*expectedJoinConfiguration))
 	// Note: capi-kubeadmcontrolplane should own ownerReferences and spec, labels and annotations should be orphaned.
 	// 		 Labels and annotations will be owned by capi-kubeadmcontrolplane-metadata after the next update
 	//		 of labels and annotations.
@@ -433,6 +438,7 @@ func TestCloneConfigsAndGenerateMachineAndSyncMachines(t *testing.T) {
 },
 "f:spec":{
 	"f:joinConfiguration":{
+		"f:controlPlane":{},
 		"f:nodeRegistration":{
 			"f:kubeletExtraArgs":{
 				"k:{\"name\":\"v\",\"value\":\"8\"}":{
@@ -444,9 +450,18 @@ func TestCloneConfigsAndGenerateMachineAndSyncMachines(t *testing.T) {
 	}})))
 
 	// Sync Machines
+
+	// Note: Ensure the client observed the latest objects so syncMachines below is not failing with conflict errors.
+	// Note: Not adding a WaitForCacheToBeUpToDate for infraObj for now as we didn't have test flakes because of it and
+	//       WaitForCacheToBeUpToDate does not support Unstructured as of now.
+	g.Expect(clientutil.WaitForCacheToBeUpToDate(ctx, r.Client, "cloneConfigsAndGenerateMachine", &m)).To(Succeed())
+	g.Expect(clientutil.WaitForCacheToBeUpToDate(ctx, r.Client, "cloneConfigsAndGenerateMachine", kubeadmConfig)).To(Succeed())
+
 	controlPlane, err := internal.NewControlPlane(ctx, r.managementCluster, r.Client, cluster, kcp, collections.FromMachines(&m))
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(r.syncMachines(ctx, controlPlane)).To(Succeed())
+	stopReconcile, err := r.syncMachines(ctx, controlPlane)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(stopReconcile).To(BeFalse())
 
 	// Verify managedFields again.
 	infraObj, err = external.GetObjectFromContractVersionedRef(ctx, env.GetAPIReader(), m.Spec.InfrastructureRef, m.Namespace)
@@ -508,6 +523,7 @@ func TestCloneConfigsAndGenerateMachineAndSyncMachines(t *testing.T) {
 },
 "f:spec":{
 	"f:joinConfiguration":{
+		"f:controlPlane":{},
 		"f:nodeRegistration":{
 			"f:kubeletExtraArgs":{
 				"k:{\"name\":\"v\",\"value\":\"8\"}":{
@@ -516,6 +532,52 @@ func TestCloneConfigsAndGenerateMachineAndSyncMachines(t *testing.T) {
 			}
 		}
 }}`,
+	}})))
+
+	// Purge managedFields from objects.
+	jsonPatch := []map[string]interface{}{
+		{
+			"op":    "replace",
+			"path":  "/metadata/managedFields",
+			"value": []metav1.ManagedFieldsEntry{{}},
+		},
+	}
+	patch, err := json.Marshal(jsonPatch)
+	g.Expect(err).ToNot(HaveOccurred())
+	for _, object := range []client.Object{&m, infraObj, kubeadmConfig} {
+		g.Expect(env.Client.Patch(ctx, object, client.RawPatch(types.JSONPatchType, patch))).To(Succeed())
+		g.Expect(object.GetManagedFields()).To(BeEmpty())
+	}
+
+	// syncMachines to run mitigation code.
+	controlPlane.Machines[m.Name] = &m
+	controlPlane.InfraResources[infraObj.GetName()] = infraObj
+	controlPlane.KubeadmConfigs[kubeadmConfig.Name] = kubeadmConfig
+	stopReconcile, err = r.syncMachines(ctx, controlPlane)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(stopReconcile).To(BeTrue())
+
+	// verify mitigation worked
+	g.Expect(env.GetAPIReader().Get(ctx, client.ObjectKeyFromObject(&m), &m)).To(Succeed())
+	g.Expect(cleanupTime(m.GetManagedFields())).To(ConsistOf(toManagedFields([]managedFieldEntry{{
+		APIVersion: clusterv1.GroupVersion.String(),
+		Manager:    kcpManagerName, // matches manager of next Apply.
+		Operation:  metav1.ManagedFieldsOperationApply,
+		FieldsV1:   `{"f:metadata":{"f:name":{}}}`,
+	}})))
+	g.Expect(env.GetAPIReader().Get(ctx, client.ObjectKeyFromObject(infraObj), infraObj)).To(Succeed())
+	g.Expect(cleanupTime(infraObj.GetManagedFields())).To(ConsistOf(toManagedFields([]managedFieldEntry{{
+		APIVersion: infraObj.GetAPIVersion(),
+		Manager:    kcpMetadataManagerName, // matches manager of next Apply.
+		Operation:  metav1.ManagedFieldsOperationApply,
+		FieldsV1:   `{"f:metadata":{"f:name":{}}}`,
+	}})))
+	g.Expect(env.GetAPIReader().Get(ctx, client.ObjectKeyFromObject(kubeadmConfig), kubeadmConfig)).To(Succeed())
+	g.Expect(cleanupTime(kubeadmConfig.GetManagedFields())).To(ConsistOf(toManagedFields([]managedFieldEntry{{
+		APIVersion: bootstrapv1.GroupVersion.String(),
+		Manager:    kcpMetadataManagerName, // matches manager of next Apply.
+		Operation:  metav1.ManagedFieldsOperationApply,
+		FieldsV1:   `{"f:metadata":{"f:name":{}}}`,
 	}})))
 }
 
